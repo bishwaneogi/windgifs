@@ -1,6 +1,6 @@
 [package]
 name = "windgifs"
-version = "0.2.0"
+version = "0.2.1"
 description = "Windows-first video to GIF editor"
 authors = ["bneog"]
 edition = "2021"

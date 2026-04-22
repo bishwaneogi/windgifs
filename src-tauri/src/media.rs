@@ -109,6 +109,8 @@ struct ExportSettings {
     dither: String,
     r#loop: bool,
     target_file_size_bytes: Option<u64>,
+    #[serde(default)]
+    compression_effort: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -196,6 +198,7 @@ struct NormalizedExportRequest {
     output_path: PathBuf,
     loop_count: i32,
     target_file_size_bytes: Option<u64>,
+    compression_effort: CompressionEffort,
 }
 
 #[derive(Debug, Clone)]
@@ -233,12 +236,21 @@ struct CompressionCandidateSpec {
     quality_score: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompressionEffort {
+    Fast,
+    Balanced,
+    Best,
+}
+
 const MIN_EXPORT_TIMEOUT: Duration = Duration::from_secs(30);
 const EXPORT_TIMEOUT_PADDING: Duration = Duration::from_secs(15);
 const EXPORT_TIMEOUT_MULTIPLIER: f64 = 8.0;
 const INPUT_SEEK_PREROLL_SECONDS: f64 = 1.0;
 const MIN_COMPRESSED_FPS: u32 = 6;
 const MIN_COMPRESSED_COLORS: u32 = 16;
+const FAST_COMPRESSION_CANDIDATES: usize = 1;
+const BALANCED_COMPRESSION_CANDIDATES: usize = 5;
 const MAX_COMPRESSION_CANDIDATES: usize = 14;
 
 #[tauri::command]
@@ -394,9 +406,12 @@ fn run_compressed_ffmpeg_export(
         );
     }
 
-    for candidate_spec in
-        build_compression_candidate_specs(request, baseline.file_size_bytes, target_file_size_bytes)
-    {
+    for candidate_spec in build_compression_candidate_specs(
+        request,
+        baseline.file_size_bytes,
+        target_file_size_bytes,
+        request.compression_effort,
+    ) {
         let candidate = run_temp_ffmpeg_export(tools, &candidate_spec.request, overlay_path)?;
         temp_paths.push(candidate.temp_path.clone());
 
@@ -475,6 +490,7 @@ fn build_compression_candidate_specs(
     request: &NormalizedExportRequest,
     baseline_file_size_bytes: Option<u64>,
     target_file_size_bytes: u64,
+    effort: CompressionEffort,
 ) -> Vec<CompressionCandidateSpec> {
     let minimum_width = 160u32.min(request.render.output_width);
     let baseline_size =
@@ -537,8 +553,16 @@ fn build_compression_candidate_specs(
             .partial_cmp(&left.quality_score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    candidates.truncate(MAX_COMPRESSION_CANDIDATES);
+    candidates.truncate(compression_candidate_limit(effort));
     candidates
+}
+
+fn compression_candidate_limit(effort: CompressionEffort) -> usize {
+    match effort {
+        CompressionEffort::Fast => FAST_COMPRESSION_CANDIDATES,
+        CompressionEffort::Balanced => BALANCED_COMPRESSION_CANDIDATES,
+        CompressionEffort::Best => MAX_COMPRESSION_CANDIDATES,
+    }
 }
 
 fn build_compression_variants(render: &NormalizedRenderSettings) -> Vec<CompressionVariant> {
@@ -980,12 +1004,15 @@ fn normalize_export_request(
     )?;
     let output_path = resolve_output_path(&request.output_path, source_path, &inspection.file_name);
     let loop_count = if request.export.r#loop { 0 } else { -1 };
+    let compression_effort =
+        normalize_compression_effort(request.export.compression_effort.as_deref())?;
 
     Ok(NormalizedExportRequest {
         render,
         output_path,
         loop_count,
         target_file_size_bytes: request.export.target_file_size_bytes,
+        compression_effort,
     })
 }
 
@@ -1148,6 +1175,15 @@ fn normalize_dither(value: &str) -> Result<&'static str, String> {
         "none" => Ok("none"),
         "sierra2_4a" => Ok("sierra2_4a"),
         _ => Err("Unsupported dithering mode for paletteuse.".to_string()),
+    }
+}
+
+fn normalize_compression_effort(value: Option<&str>) -> Result<CompressionEffort, String> {
+    match value.unwrap_or("balanced").trim() {
+        "" | "balanced" => Ok(CompressionEffort::Balanced),
+        "fast" => Ok(CompressionEffort::Fast),
+        "best" => Ok(CompressionEffort::Best),
+        _ => Err("Unsupported compression effort.".to_string()),
     }
 }
 
@@ -1710,6 +1746,7 @@ mod tests {
                 dither: "sierra2_4a".to_string(),
                 r#loop: true,
                 target_file_size_bytes: None,
+                compression_effort: Some("balanced".to_string()),
             },
             overlay_png_data_url: None,
         };
@@ -1753,6 +1790,7 @@ mod tests {
                 dither: "sierra2_4a".to_string(),
                 r#loop: true,
                 target_file_size_bytes: Some(target_file_size_bytes),
+                compression_effort: Some("balanced".to_string()),
             },
             overlay_png_data_url: None,
         };
@@ -1798,6 +1836,7 @@ mod tests {
                 dither: "sierra2_4a".to_string(),
                 r#loop: true,
                 target_file_size_bytes: None,
+                compression_effort: Some("balanced".to_string()),
             },
             overlay_png_data_url: None,
             frame_time_seconds: Some(1.0),
@@ -1859,6 +1898,7 @@ mod tests {
             output_path: PathBuf::from("output.gif"),
             loop_count: 0,
             target_file_size_bytes: None,
+            compression_effort: CompressionEffort::Balanced,
         };
 
         let graph = build_filter_graph(&request.render, true);
@@ -1952,10 +1992,15 @@ mod tests {
             output_path: PathBuf::from("output.gif"),
             loop_count: 0,
             target_file_size_bytes: Some(1024 * 1024),
+            compression_effort: CompressionEffort::Best,
         };
 
-        let candidates =
-            build_compression_candidate_specs(&request, Some(5 * 1024 * 1024), 1024 * 1024);
+        let candidates = build_compression_candidate_specs(
+            &request,
+            Some(5 * 1024 * 1024),
+            1024 * 1024,
+            CompressionEffort::Best,
+        );
 
         assert!(!candidates.is_empty());
         assert!(candidates
@@ -1967,5 +2012,54 @@ mod tests {
         assert!(candidates
             .iter()
             .all(|candidate| candidate.request.render.dither == request.render.dither));
+    }
+
+    #[test]
+    fn compression_effort_limits_candidate_search() {
+        let request = NormalizedExportRequest {
+            render: NormalizedRenderSettings {
+                source_path: PathBuf::from("input.mp4"),
+                trim_start: 0.0,
+                trim_end: 5.0,
+                crop_x: 0,
+                crop_y: 0,
+                crop_width: 1920,
+                crop_height: 1080,
+                output_width: 720,
+                output_height: 405,
+                fps: 20,
+                colors: 128,
+                dither: "sierra2_4a",
+                overlay_png_data_url: None,
+            },
+            output_path: PathBuf::from("output.gif"),
+            loop_count: 0,
+            target_file_size_bytes: Some(1024 * 1024),
+            compression_effort: CompressionEffort::Balanced,
+        };
+
+        let fast = build_compression_candidate_specs(
+            &request,
+            Some(5 * 1024 * 1024),
+            1024 * 1024,
+            CompressionEffort::Fast,
+        );
+        let balanced = build_compression_candidate_specs(
+            &request,
+            Some(5 * 1024 * 1024),
+            1024 * 1024,
+            CompressionEffort::Balanced,
+        );
+        let best = build_compression_candidate_specs(
+            &request,
+            Some(5 * 1024 * 1024),
+            1024 * 1024,
+            CompressionEffort::Best,
+        );
+
+        assert_eq!(fast.len(), FAST_COMPRESSION_CANDIDATES);
+        assert!(balanced.len() <= BALANCED_COMPRESSION_CANDIDATES);
+        assert!(balanced.len() > fast.len());
+        assert!(best.len() >= balanced.len());
     }
 }

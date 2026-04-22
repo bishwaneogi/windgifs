@@ -1,6 +1,7 @@
 export type MetadataSource = "ffprobe" | "html-video";
 
 export type DitherMode = "bayer" | "floyd_steinberg" | "none" | "sierra2_4a";
+export type CompressionEffort = "balanced" | "best" | "fast";
 export type ExportPresetId = "balanced" | "high" | "small";
 export type ShapeKind = "arrow" | "ellipse" | "rect";
 
@@ -60,6 +61,7 @@ export interface ExportSettings {
   loop: boolean;
   targetFileSizeEnabled: boolean;
   targetFileSizeMb: number;
+  compressionEffort: CompressionEffort;
 }
 
 export interface EditorProject {
@@ -86,6 +88,7 @@ export interface NativeExportSettings {
   dither: DitherMode;
   loop: boolean;
   targetFileSizeBytes: number | null;
+  compressionEffort: CompressionEffort;
 }
 
 export interface GifExportRequest {

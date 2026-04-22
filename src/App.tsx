@@ -93,6 +93,8 @@ type BatchVideo = {
   lastExportResult: GifExportResult | null;
 };
 
+const BATCH_EXPORT_CONCURRENCY = 2;
+
 type InteractionState =
   | {
       kind: "crop-move";
@@ -1076,51 +1078,73 @@ function App() {
     setInfoMessage(
       videosToExport.length === 1
         ? "Exporting GIF..."
-        : `Exporting 1/${videosToExport.length} GIFs...`,
+        : `Exporting ${videosToExport.length} GIFs, ${Math.min(
+            BATCH_EXPORT_CONCURRENCY,
+            videosToExport.length,
+          )} at a time...`,
     );
 
     const results: GifExportResult[] = [];
     const failures: string[] = [];
+    let nextExportIndex = 0;
+    let completedExports = 0;
+
     try {
-      for (let index = 0; index < videosToExport.length; index += 1) {
-        const video = videosToExport[index];
-        const resolvedOutputPath =
-          video.outputPath.trim() ||
-          buildDefaultOutputPath(video.project.source.sourcePath, video.project.source.fileName);
+      const runExportWorker = async () => {
+        while (nextExportIndex < videosToExport.length) {
+          const video = videosToExport[nextExportIndex];
+          nextExportIndex += 1;
+          const resolvedOutputPath =
+            video.outputPath.trim() ||
+            buildDefaultOutputPath(video.project.source.sourcePath, video.project.source.fileName);
 
-        setExportProgress({ current: index + 1, total: videosToExport.length });
-        setInfoMessage(
-          videosToExport.length === 1
-            ? "Exporting GIF..."
-            : `Exporting ${index + 1}/${videosToExport.length}: ${video.project.source.fileName}`,
-        );
+          try {
+            const overlayPngDataUrl = renderMarkupOverlayPng(video.project);
+            const result = await exportGif(
+              buildGifExportRequest(video.project, resolvedOutputPath, overlayPngDataUrl),
+            );
 
-        try {
-          const overlayPngDataUrl = renderMarkupOverlayPng(video.project);
-          const result = await exportGif(
-            buildGifExportRequest(video.project, resolvedOutputPath, overlayPngDataUrl),
-          );
-
-          results.push(result);
-          setBatchVideos((previousVideos) =>
-            previousVideos.map((previousVideo) =>
-              previousVideo.id === video.id
-                ? {
-                    ...previousVideo,
-                    outputPath: result.outputPath,
-                    lastExportResult: result,
-                  }
-                : previousVideo,
-            ),
-          );
-        } catch (error) {
-          failures.push(
-            `${video.project.source.fileName}: ${
-              error instanceof Error ? error.message : "GIF export failed."
-            }`,
-          );
+            results.push(result);
+            setBatchVideos((previousVideos) =>
+              previousVideos.map((previousVideo) =>
+                previousVideo.id === video.id
+                  ? {
+                      ...previousVideo,
+                      outputPath: result.outputPath,
+                      lastExportResult: result,
+                    }
+                  : previousVideo,
+              ),
+            );
+          } catch (error) {
+            failures.push(
+              `${video.project.source.fileName}: ${
+                error instanceof Error ? error.message : "GIF export failed."
+              }`,
+            );
+          } finally {
+            completedExports += 1;
+            setExportProgress({ current: completedExports, total: videosToExport.length });
+            setInfoMessage(
+              videosToExport.length === 1
+                ? "Exporting GIF..."
+                : `Exported ${completedExports}/${videosToExport.length} GIFs...`,
+            );
+          }
         }
-      }
+      };
+
+      await Promise.all(
+        Array.from(
+          { length: Math.min(BATCH_EXPORT_CONCURRENCY, videosToExport.length) },
+          runExportWorker,
+        ),
+      );
+
+      results.sort((left, right) =>
+        videosToExport.findIndex((video) => video.outputPath === left.outputPath) -
+        videosToExport.findIndex((video) => video.outputPath === right.outputPath),
+      );
 
       if (results.length > 0) {
         const knownTotalBytes = results.every((result) => result.fileSizeBytes !== null)
@@ -1143,7 +1167,6 @@ function App() {
       setExportProgress(null);
     }
   }
-
   async function onRevealExport() {
     if (!lastExportResult?.outputPath || !isDesktopApp()) {
       return;
@@ -1351,6 +1374,7 @@ function App() {
         useSourceResolution: previousExportSettings?.useSourceResolution ?? false,
         targetFileSizeEnabled: previousExportSettings?.targetFileSizeEnabled ?? false,
         targetFileSizeMb: previousExportSettings?.targetFileSizeMb ?? 4,
+        compressionEffort: previousExportSettings?.compressionEffort ?? "balanced",
       };
 
       setGlobalOutputSettings(nextExportSettings);
@@ -2504,6 +2528,22 @@ function App() {
                   </select>
                 </label>
                 <label>
+                  Compression
+                  <select
+                    value={project?.export.compressionEffort ?? "balanced"}
+                    onChange={(event) =>
+                      updateExport(
+                        "compressionEffort",
+                        event.currentTarget.value as EditorProject["export"]["compressionEffort"],
+                      )
+                    }
+                  >
+                    <option value="fast">Fast</option>
+                    <option value="balanced">Balanced</option>
+                    <option value="best">Best</option>
+                  </select>
+                </label>
+                <label>
                   Start
                   <input
                     type="number"
@@ -2658,7 +2698,7 @@ function App() {
                   disabled={!canPrepareExport || isExporting}
                 >
                   {isExporting && exportProgress
-                    ? `Exporting ${Math.max(1, exportProgress.current)}/${exportProgress.total}`
+                    ? `Exporting ${exportProgress.current}/${exportProgress.total}`
                     : videosSelectedForExport.length > 1
                       ? `Export ${videosSelectedForExport.length} GIFs`
                       : "Export GIF"}

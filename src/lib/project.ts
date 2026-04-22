@@ -80,6 +80,7 @@ function createDefaultExportSettings(width?: number): ExportSettings {
     useSourceResolution: false,
     targetFileSizeEnabled: false,
     targetFileSizeMb: 4,
+    compressionEffort: "balanced",
   };
 }
 
@@ -155,6 +156,7 @@ export function updateExportPreset(
       useSourceResolution: project.export.useSourceResolution,
       targetFileSizeEnabled: project.export.targetFileSizeEnabled,
       targetFileSizeMb: project.export.targetFileSizeMb,
+      compressionEffort: project.export.compressionEffort,
     },
   };
 }

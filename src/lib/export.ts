@@ -195,6 +195,7 @@ export function buildGifExportRequest(
       dither: project.export.dither,
       loop: project.export.loop,
       targetFileSizeBytes,
+      compressionEffort: project.export.compressionEffort,
     },
     overlayPngDataUrl,
   };
@@ -218,6 +219,7 @@ export function buildGifPreviewRequest(
       dither: project.export.dither,
       loop: project.export.loop,
       targetFileSizeBytes: null,
+      compressionEffort: project.export.compressionEffort,
     },
     overlayPngDataUrl,
     frameTimeSeconds,
