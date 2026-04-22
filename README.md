@@ -1,5 +1,7 @@
 # WindGifs
 
+![WindGifs app screenshot](windgifs_screenshot.jpg)
+
 WindGifs is a Windows-first desktop tool for turning short video clips into clean,
 controllable GIFs. It is built with Tauri, React, TypeScript, and FFmpeg.
 
