@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::io::Read;
@@ -173,6 +174,20 @@ impl NormalizedRenderSettings {
             ..self.clone()
         }
     }
+
+    fn with_compression_options(
+        &self,
+        output_width: u32,
+        fps: u32,
+        colors: u32,
+        dither: &'static str,
+    ) -> Self {
+        let mut next = self.with_width(output_width);
+        next.fps = fps;
+        next.colors = colors;
+        next.dither = dither;
+        next
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -190,13 +205,6 @@ struct NormalizedPreviewRequest {
 }
 
 impl NormalizedExportRequest {
-    fn with_width(&self, output_width: u32) -> Self {
-        Self {
-            render: self.render.with_width(output_width),
-            ..self.clone()
-        }
-    }
-
     fn with_output_path(&self, output_path: PathBuf) -> Self {
         Self {
             output_path,
@@ -212,10 +220,26 @@ struct TempExportCandidate {
     file_size_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CompressionVariant {
+    fps: u32,
+    colors: u32,
+    dither: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct CompressionCandidateSpec {
+    request: NormalizedExportRequest,
+    quality_score: f64,
+}
+
 const MIN_EXPORT_TIMEOUT: Duration = Duration::from_secs(30);
 const EXPORT_TIMEOUT_PADDING: Duration = Duration::from_secs(15);
 const EXPORT_TIMEOUT_MULTIPLIER: f64 = 8.0;
 const INPUT_SEEK_PREROLL_SECONDS: f64 = 1.0;
+const MIN_COMPRESSED_FPS: u32 = 6;
+const MIN_COMPRESSED_COLORS: u32 = 16;
+const MAX_COMPRESSION_CANDIDATES: usize = 14;
 
 #[tauri::command]
 pub fn get_ffmpeg_status() -> FfmpegStatus {
@@ -284,7 +308,9 @@ pub async fn export_gif(request: GifExportRequest) -> Result<GifExportResult, St
 }
 
 #[tauri::command]
-pub async fn render_quality_preview(request: GifPreviewRequest) -> Result<GifPreviewResult, String> {
+pub async fn render_quality_preview(
+    request: GifPreviewRequest,
+) -> Result<GifPreviewResult, String> {
     tauri::async_runtime::spawn_blocking(move || render_quality_preview_blocking(request))
         .await
         .map_err(|error| format!("GIF preview task failed: {error}"))?
@@ -368,86 +394,18 @@ fn run_compressed_ffmpeg_export(
         );
     }
 
-    let minimum_width = 160u32.min(request.render.output_width);
-    if minimum_width >= request.render.output_width {
-        return finalize_compressed_candidate(
+    for candidate_spec in
+        build_compression_candidate_specs(request, baseline.file_size_bytes, target_file_size_bytes)
+    {
+        let candidate = run_temp_ffmpeg_export(tools, &candidate_spec.request, overlay_path)?;
+        temp_paths.push(candidate.temp_path.clone());
+
+        if should_replace_best_candidate(
             request,
-            overlay_path.is_some(),
-            best_candidate,
-            &temp_paths,
-        );
-    }
-
-    let mut low = minimum_width;
-    let mut high = request.render.output_width;
-    let mut candidate_widths = Vec::new();
-
-    if let Some(baseline_file_size_bytes) = baseline.file_size_bytes {
-        if let Some(predicted_width) = predict_target_width(
-            request.render.output_width,
-            baseline_file_size_bytes,
+            &best_candidate,
+            &candidate,
             target_file_size_bytes,
-            minimum_width,
         ) {
-            candidate_widths.push(predicted_width);
-
-            let candidate_request = request.with_width(predicted_width);
-            let candidate = run_temp_ffmpeg_export(tools, &candidate_request, overlay_path)?;
-            temp_paths.push(candidate.temp_path.clone());
-
-            if should_replace_best_candidate(&best_candidate, &candidate, target_file_size_bytes) {
-                best_candidate = candidate.clone();
-            }
-
-            if let Some(file_size_bytes) = candidate.file_size_bytes {
-                if file_size_bytes > target_file_size_bytes {
-                    high = predicted_width.saturating_sub(1);
-                } else {
-                    low = predicted_width;
-                }
-            }
-        }
-    }
-
-    while high.saturating_sub(low) > 12 {
-        let middle = ((low + high) / 2).max(minimum_width);
-        if middle == low || middle == high {
-            break;
-        }
-        if candidate_widths.contains(&middle) {
-            break;
-        }
-        candidate_widths.push(middle);
-
-        let candidate_request = request.with_width(middle);
-        let candidate = run_temp_ffmpeg_export(tools, &candidate_request, overlay_path)?;
-        temp_paths.push(candidate.temp_path.clone());
-
-        if should_replace_best_candidate(&best_candidate, &candidate, target_file_size_bytes) {
-            best_candidate = candidate.clone();
-        }
-
-        if let Some(file_size_bytes) = candidate.file_size_bytes {
-            if file_size_bytes > target_file_size_bytes {
-                high = middle.saturating_sub(1);
-            } else {
-                low = middle;
-            }
-        } else {
-            high = middle.saturating_sub(1);
-        }
-    }
-
-    for width in [low, high, minimum_width] {
-        if width == 0 || candidate_widths.contains(&width) {
-            continue;
-        }
-
-        let candidate_request = request.with_width(width);
-        let candidate = run_temp_ffmpeg_export(tools, &candidate_request, overlay_path)?;
-        temp_paths.push(candidate.temp_path.clone());
-
-        if should_replace_best_candidate(&best_candidate, &candidate, target_file_size_bytes) {
             best_candidate = candidate;
         }
     }
@@ -472,6 +430,7 @@ fn run_temp_ffmpeg_export(
 }
 
 fn should_replace_best_candidate(
+    original_request: &NormalizedExportRequest,
     current_best: &TempExportCandidate,
     candidate: &TempExportCandidate,
     target_file_size_bytes: u64,
@@ -488,15 +447,215 @@ fn should_replace_best_candidate(
                 return candidate_within_target;
             }
 
-            let current_gap = current_size.abs_diff(target_file_size_bytes);
-            let candidate_gap = candidate_size.abs_diff(target_file_size_bytes);
+            let current_score =
+                compression_quality_score(&original_request.render, &current_best.request.render);
+            let candidate_score =
+                compression_quality_score(&original_request.render, &candidate.request.render);
 
-            if candidate_gap != current_gap {
-                return candidate_gap < current_gap;
+            if current_within_target {
+                if (candidate_score - current_score).abs() > 0.001 {
+                    return candidate_score > current_score;
+                }
+
+                return candidate_size > current_size;
             }
 
-            candidate.request.render.output_width > current_best.request.render.output_width
+            let size_gap = current_size.abs_diff(candidate_size);
+            let close_enough = size_gap <= (target_file_size_bytes / 32).max(1);
+            if close_enough && (candidate_score - current_score).abs() > 0.001 {
+                return candidate_score > current_score;
+            }
+
+            candidate_size < current_size
         }
+    }
+}
+
+fn build_compression_candidate_specs(
+    request: &NormalizedExportRequest,
+    baseline_file_size_bytes: Option<u64>,
+    target_file_size_bytes: u64,
+) -> Vec<CompressionCandidateSpec> {
+    let minimum_width = 160u32.min(request.render.output_width);
+    let baseline_size =
+        baseline_file_size_bytes.unwrap_or(target_file_size_bytes.saturating_mul(2));
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+
+    for variant in build_compression_variants(&request.render) {
+        let estimated_size_at_full_width =
+            (baseline_size as f64 * compression_size_ratio(&request.render, &variant)).max(1.0);
+        let predicted_width = if estimated_size_at_full_width <= target_file_size_bytes as f64 {
+            request.render.output_width
+        } else {
+            predict_target_width(
+                request.render.output_width,
+                estimated_size_at_full_width.round() as u64,
+                target_file_size_bytes,
+                minimum_width,
+            )
+            .unwrap_or(minimum_width)
+        };
+
+        for width in candidate_widths_for_prediction(
+            predicted_width,
+            request.render.output_width,
+            minimum_width,
+        ) {
+            if width == request.render.output_width
+                && variant.fps == request.render.fps
+                && variant.colors == request.render.colors
+                && variant.dither == request.render.dither
+            {
+                continue;
+            }
+
+            if !seen.insert((width, variant.fps, variant.colors, variant.dither)) {
+                continue;
+            }
+
+            let render = request.render.with_compression_options(
+                width,
+                variant.fps,
+                variant.colors,
+                variant.dither,
+            );
+            let quality_score = compression_quality_score(&request.render, &render);
+            candidates.push(CompressionCandidateSpec {
+                request: NormalizedExportRequest {
+                    render,
+                    ..request.clone()
+                },
+                quality_score,
+            });
+        }
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .quality_score
+            .partial_cmp(&left.quality_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    candidates.truncate(MAX_COMPRESSION_CANDIDATES);
+    candidates
+}
+
+fn build_compression_variants(render: &NormalizedRenderSettings) -> Vec<CompressionVariant> {
+    let mut seen = HashSet::new();
+    let mut variants = Vec::new();
+    let mut push_variant = |fps: u32, colors: u32, dither: &'static str| {
+        let variant = CompressionVariant {
+            fps: compression_fps(render.fps, fps),
+            colors: compression_colors(render.colors, colors),
+            dither,
+        };
+
+        if seen.insert((variant.fps, variant.colors, variant.dither)) {
+            variants.push(variant);
+        }
+    };
+
+    push_variant(render.fps, render.colors, render.dither);
+    push_variant(render.fps, 96, render.dither);
+    push_variant(
+        (render.fps as f64 * 0.85).round() as u32,
+        render.colors,
+        render.dither,
+    );
+    push_variant((render.fps as f64 * 0.85).round() as u32, 96, "sierra2_4a");
+    push_variant((render.fps as f64 * 0.70).round() as u32, 96, "sierra2_4a");
+    push_variant((render.fps as f64 * 0.70).round() as u32, 64, "bayer");
+    push_variant((render.fps as f64 * 0.55).round() as u32, 64, "bayer");
+    push_variant((render.fps as f64 * 0.55).round() as u32, 48, "bayer");
+    push_variant((render.fps as f64 * 0.40).round() as u32, 48, "none");
+    push_variant(MIN_COMPRESSED_FPS, 32, "none");
+
+    variants
+}
+
+fn compression_fps(original_fps: u32, requested_fps: u32) -> u32 {
+    let minimum = MIN_COMPRESSED_FPS.min(original_fps).max(1);
+    requested_fps.clamp(minimum, original_fps.max(minimum))
+}
+
+fn compression_colors(original_colors: u32, requested_colors: u32) -> u32 {
+    let minimum = MIN_COMPRESSED_COLORS.min(original_colors).max(2);
+    requested_colors.clamp(minimum, original_colors.max(minimum))
+}
+
+fn candidate_widths_for_prediction(
+    predicted_width: u32,
+    original_width: u32,
+    minimum_width: u32,
+) -> Vec<u32> {
+    let mut widths = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push_width = |width: u32| {
+        let safe_width = width.clamp(minimum_width, original_width);
+        if seen.insert(safe_width) {
+            widths.push(safe_width);
+        }
+    };
+
+    push_width(predicted_width);
+    push_width(((predicted_width as f64) * 0.94).round() as u32);
+
+    if predicted_width >= original_width {
+        push_width(original_width);
+    } else {
+        push_width(((predicted_width as f64) * 0.88).round() as u32);
+    }
+
+    widths
+}
+
+fn compression_size_ratio(
+    original: &NormalizedRenderSettings,
+    variant: &CompressionVariant,
+) -> f64 {
+    let fps_ratio = variant.fps as f64 / original.fps.max(1) as f64;
+    let color_ratio = palette_size_factor(variant.colors) / palette_size_factor(original.colors);
+    let dither_ratio = dither_size_factor(variant.dither) / dither_size_factor(original.dither);
+
+    (fps_ratio * color_ratio * dither_ratio).clamp(0.08, 1.0)
+}
+
+fn compression_quality_score(
+    original: &NormalizedRenderSettings,
+    candidate: &NormalizedRenderSettings,
+) -> f64 {
+    let width_score = candidate.output_width as f64 / original.output_width.max(1) as f64;
+    let fps_score = candidate.fps as f64 / original.fps.max(1) as f64;
+    let color_score = (candidate.colors as f64 / original.colors.max(1) as f64).sqrt();
+    let dither_score = dither_quality_factor(candidate.dither);
+
+    width_score * 0.62 + fps_score * 0.20 + color_score * 0.13 + dither_score * 0.05
+}
+
+fn palette_size_factor(colors: u32) -> f64 {
+    (colors.clamp(2, 256) as f64 / 128.0)
+        .sqrt()
+        .clamp(0.22, 1.45)
+}
+
+fn dither_size_factor(dither: &str) -> f64 {
+    match dither {
+        "none" => 0.74,
+        "bayer" => 0.88,
+        "sierra2_4a" => 1.0,
+        "floyd_steinberg" => 1.08,
+        _ => 1.0,
+    }
+}
+
+fn dither_quality_factor(dither: &str) -> f64 {
+    match dither {
+        "floyd_steinberg" => 1.0,
+        "sierra2_4a" => 0.96,
+        "bayer" => 0.82,
+        "none" => 0.68,
+        _ => 0.9,
     }
 }
 
@@ -549,47 +708,51 @@ fn finalize_compressed_candidate(
 
 fn build_filter_graph(render: &NormalizedRenderSettings, has_overlay: bool) -> String {
     let base_chain = build_base_chain(render);
+    let palettegen = palettegen_options(render);
+    let paletteuse = paletteuse_options(render);
 
     if has_overlay {
         format!(
-            "[0:v]{base_chain}[base];[1:v]scale={}:{}:flags=lanczos,format=rgba[overlay];[base][overlay]overlay=0:0:format=auto:shortest=1[composited];[composited]split[palette_in][gif_in];[palette_in]palettegen=max_colors={}:reserve_transparent=0[palette];[gif_in][palette]paletteuse=dither={}[out]",
+            "[0:v]{base_chain}[base];[1:v]scale={}:{}:flags=lanczos,format=rgba[overlay];[base][overlay]overlay=0:0:format=auto:shortest=1[composited];[composited]split[palette_in][gif_in];[palette_in]palettegen={palettegen}[palette];[gif_in][palette]paletteuse={paletteuse}[out]",
             render.output_width,
-            render.output_height,
-            render.colors,
-            render.dither
+            render.output_height
         )
     } else {
         format!(
-            "[0:v]{base_chain},split[palette_in][gif_in];[palette_in]palettegen=max_colors={}:reserve_transparent=0[palette];[gif_in][palette]paletteuse=dither={}[out]",
-            render.colors,
-            render.dither
+            "[0:v]{base_chain},split[palette_in][gif_in];[palette_in]palettegen={palettegen}[palette];[gif_in][palette]paletteuse={paletteuse}[out]",
         )
     }
 }
 
-fn build_preview_filter_graph(
-    request: &NormalizedPreviewRequest,
-    has_overlay: bool,
-) -> String {
+fn build_preview_filter_graph(request: &NormalizedPreviewRequest, has_overlay: bool) -> String {
     let base_chain = build_base_chain(&request.render);
+    let palettegen = palettegen_options(&request.render);
+    let paletteuse = paletteuse_options(&request.render);
 
     if has_overlay {
         format!(
-            "[0:v]{base_chain}[base];[1:v]scale={}:{}:flags=lanczos,format=rgba[overlay];[base][overlay]overlay=0:0:format=auto:shortest=1[composited];[composited]split[palette_in][preview_seq];[palette_in]palettegen=max_colors={}:reserve_transparent=0[palette];[preview_seq]select='eq(n\\,{})'[preview_in];[preview_in][palette]paletteuse=dither={}[out]",
+            "[0:v]{base_chain}[base];[1:v]scale={}:{}:flags=lanczos,format=rgba[overlay];[base][overlay]overlay=0:0:format=auto:shortest=1[composited];[composited]split[palette_in][preview_seq];[palette_in]palettegen={palettegen}[palette];[preview_seq]select='eq(n\\,{})'[preview_in];[preview_in][palette]paletteuse={paletteuse}[out]",
             request.render.output_width,
             request.render.output_height,
-            request.render.colors,
             request.frame_index,
-            request.render.dither,
         )
     } else {
         format!(
-            "[0:v]{base_chain},split[palette_in][preview_seq];[palette_in]palettegen=max_colors={}:reserve_transparent=0[palette];[preview_seq]select='eq(n\\,{})'[preview_in];[preview_in][palette]paletteuse=dither={}[out]",
-            request.render.colors,
+            "[0:v]{base_chain},split[palette_in][preview_seq];[palette_in]palettegen={palettegen}[palette];[preview_seq]select='eq(n\\,{})'[preview_in];[preview_in][palette]paletteuse={paletteuse}[out]",
             request.frame_index,
-            request.render.dither,
         )
     }
+}
+
+fn palettegen_options(render: &NormalizedRenderSettings) -> String {
+    format!(
+        "max_colors={}:reserve_transparent=0:stats_mode=diff",
+        render.colors
+    )
+}
+
+fn paletteuse_options(render: &NormalizedRenderSettings) -> String {
+    format!("dither={}:diff_mode=rectangle", render.dither)
 }
 
 fn build_base_chain(render: &NormalizedRenderSettings) -> String {
@@ -688,7 +851,11 @@ fn run_ffmpeg_export_with_filter_graph(
         .ok()
         .map(|metadata| metadata.len());
 
-    Ok(build_export_result(request, file_size_bytes, overlay_path.is_some()))
+    Ok(build_export_result(
+        request,
+        file_size_bytes,
+        overlay_path.is_some(),
+    ))
 }
 
 fn run_ffmpeg_preview(
@@ -863,7 +1030,10 @@ fn normalize_preview_request(
     )?;
     let frame_index = resolve_preview_frame_index(&render, request.frame_time_seconds);
 
-    Ok(NormalizedPreviewRequest { render, frame_index })
+    Ok(NormalizedPreviewRequest {
+        render,
+        frame_index,
+    })
 }
 
 fn normalize_render_settings(
@@ -1326,8 +1496,7 @@ impl WindowsErrorModeGuard {
         const SEM_FAILCRITICALERRORS: u32 = 0x0001;
         const SEM_NOGPFAULTERRORBOX: u32 = 0x0002;
         const SEM_NOOPENFILEERRORBOX: u32 = 0x8000;
-        let new_mode =
-            SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX;
+        let new_mode = SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX;
 
         let mut previous_mode = 0u32;
         let active = unsafe { SetThreadErrorMode(new_mode, &mut previous_mode) != 0 };
@@ -1580,6 +1749,57 @@ mod tests {
 
     #[test]
     #[ignore = "requires WINDGIFS_TEST_VIDEO to point at a real local video file"]
+    fn smoke_compressed_export_from_env_video() {
+        let source_path = std::env::var("WINDGIFS_TEST_VIDEO")
+            .expect("WINDGIFS_TEST_VIDEO must be set for the compressed smoke export test");
+
+        let source_path = sanitize_input_path(&source_path);
+        let output_path = std::env::temp_dir().join("windgifs-smoke-compressed-export.gif");
+        let _ = fs::remove_file(&output_path);
+        let target_file_size_bytes = 1024 * 1024;
+
+        let request = GifExportRequest {
+            source_path: source_path.display().to_string(),
+            output_path: output_path.display().to_string(),
+            trim: TrimRange {
+                start: 0.0,
+                end: 5.0,
+            },
+            crop: CropRegion {
+                enabled: true,
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            export: ExportSettings {
+                width: 540,
+                fps: 15,
+                colors: 96,
+                dither: "sierra2_4a".to_string(),
+                r#loop: true,
+                target_file_size_bytes: Some(target_file_size_bytes),
+            },
+            overlay_png_data_url: None,
+        };
+
+        let result = export_gif_blocking(request).expect("compressed smoke export should succeed");
+        let file_size_bytes = result
+            .file_size_bytes
+            .expect("compressed export should report a file size");
+
+        assert!(
+            file_size_bytes <= target_file_size_bytes || result.width <= 160,
+            "expected export to fit target or reach minimum width, got {} bytes at {}px",
+            file_size_bytes,
+            result.width
+        );
+
+        let _ = fs::remove_file(&output_path);
+    }
+
+    #[test]
+    #[ignore = "requires WINDGIFS_TEST_VIDEO to point at a real local video file"]
     fn smoke_preview_from_env_video() {
         let source_path = std::env::var("WINDGIFS_TEST_VIDEO")
             .expect("WINDGIFS_TEST_VIDEO must be set for the smoke preview test");
@@ -1609,7 +1829,8 @@ mod tests {
             frame_time_seconds: Some(1.0),
         };
 
-        let result = render_quality_preview_blocking(request).expect("smoke preview should succeed");
+        let result =
+            render_quality_preview_blocking(request).expect("smoke preview should succeed");
 
         assert!(result.data_url.starts_with("data:image/png;base64,"));
         assert_eq!(result.width, 540);
@@ -1669,6 +1890,8 @@ mod tests {
         let graph = build_filter_graph(&request.render, true);
 
         assert!(graph.contains("overlay=0:0:format=auto:shortest=1"));
+        assert!(graph.contains("palettegen=max_colors=96:reserve_transparent=0:stats_mode=diff"));
+        assert!(graph.contains("paletteuse=dither=sierra2_4a:diff_mode=rectangle"));
     }
 
     #[test]
@@ -1730,5 +1953,45 @@ mod tests {
         let graph = build_preview_filter_graph(&request, false);
 
         assert!(graph.contains("select='eq(n\\,12)'"));
+        assert!(graph.contains("stats_mode=diff"));
+        assert!(graph.contains("diff_mode=rectangle"));
+    }
+
+    #[test]
+    fn compression_candidates_trade_more_than_width() {
+        let request = NormalizedExportRequest {
+            render: NormalizedRenderSettings {
+                source_path: PathBuf::from("input.mp4"),
+                trim_start: 0.0,
+                trim_end: 5.0,
+                crop_x: 0,
+                crop_y: 0,
+                crop_width: 1920,
+                crop_height: 1080,
+                output_width: 720,
+                output_height: 405,
+                fps: 20,
+                colors: 128,
+                dither: "floyd_steinberg",
+                overlay_png_data_url: None,
+            },
+            output_path: PathBuf::from("output.gif"),
+            loop_count: 0,
+            target_file_size_bytes: Some(1024 * 1024),
+        };
+
+        let candidates =
+            build_compression_candidate_specs(&request, Some(5 * 1024 * 1024), 1024 * 1024);
+
+        assert!(!candidates.is_empty());
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.request.render.fps < request.render.fps));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.request.render.colors < request.render.colors));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.request.render.dither == "bayer"));
     }
 }
