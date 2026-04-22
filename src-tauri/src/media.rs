@@ -544,11 +544,11 @@ fn build_compression_candidate_specs(
 fn build_compression_variants(render: &NormalizedRenderSettings) -> Vec<CompressionVariant> {
     let mut seen = HashSet::new();
     let mut variants = Vec::new();
-    let mut push_variant = |fps: u32, colors: u32, dither: &'static str| {
+    let mut push_variant = |fps: u32, colors: u32| {
         let variant = CompressionVariant {
             fps: compression_fps(render.fps, fps),
             colors: compression_colors(render.colors, colors),
-            dither,
+            dither: render.dither,
         };
 
         if seen.insert((variant.fps, variant.colors, variant.dither)) {
@@ -556,20 +556,16 @@ fn build_compression_variants(render: &NormalizedRenderSettings) -> Vec<Compress
         }
     };
 
-    push_variant(render.fps, render.colors, render.dither);
-    push_variant(render.fps, 96, render.dither);
-    push_variant(
-        (render.fps as f64 * 0.85).round() as u32,
-        render.colors,
-        render.dither,
-    );
-    push_variant((render.fps as f64 * 0.85).round() as u32, 96, "sierra2_4a");
-    push_variant((render.fps as f64 * 0.70).round() as u32, 96, "sierra2_4a");
-    push_variant((render.fps as f64 * 0.70).round() as u32, 64, "bayer");
-    push_variant((render.fps as f64 * 0.55).round() as u32, 64, "bayer");
-    push_variant((render.fps as f64 * 0.55).round() as u32, 48, "bayer");
-    push_variant((render.fps as f64 * 0.40).round() as u32, 48, "none");
-    push_variant(MIN_COMPRESSED_FPS, 32, "none");
+    push_variant(render.fps, render.colors);
+    push_variant(render.fps, 96);
+    push_variant((render.fps as f64 * 0.85).round() as u32, render.colors);
+    push_variant((render.fps as f64 * 0.85).round() as u32, 96);
+    push_variant((render.fps as f64 * 0.70).round() as u32, 96);
+    push_variant((render.fps as f64 * 0.70).round() as u32, 64);
+    push_variant((render.fps as f64 * 0.55).round() as u32, 64);
+    push_variant((render.fps as f64 * 0.55).round() as u32, 48);
+    push_variant((render.fps as f64 * 0.40).round() as u32, 48);
+    push_variant(MIN_COMPRESSED_FPS, 32);
 
     variants
 }
@@ -616,9 +612,8 @@ fn compression_size_ratio(
 ) -> f64 {
     let fps_ratio = variant.fps as f64 / original.fps.max(1) as f64;
     let color_ratio = palette_size_factor(variant.colors) / palette_size_factor(original.colors);
-    let dither_ratio = dither_size_factor(variant.dither) / dither_size_factor(original.dither);
 
-    (fps_ratio * color_ratio * dither_ratio).clamp(0.08, 1.0)
+    (fps_ratio * color_ratio).clamp(0.08, 1.0)
 }
 
 fn compression_quality_score(
@@ -628,35 +623,14 @@ fn compression_quality_score(
     let width_score = candidate.output_width as f64 / original.output_width.max(1) as f64;
     let fps_score = candidate.fps as f64 / original.fps.max(1) as f64;
     let color_score = (candidate.colors as f64 / original.colors.max(1) as f64).sqrt();
-    let dither_score = dither_quality_factor(candidate.dither);
 
-    width_score * 0.62 + fps_score * 0.20 + color_score * 0.13 + dither_score * 0.05
+    width_score * 0.65 + fps_score * 0.22 + color_score * 0.13
 }
 
 fn palette_size_factor(colors: u32) -> f64 {
     (colors.clamp(2, 256) as f64 / 128.0)
         .sqrt()
         .clamp(0.22, 1.45)
-}
-
-fn dither_size_factor(dither: &str) -> f64 {
-    match dither {
-        "none" => 0.74,
-        "bayer" => 0.88,
-        "sierra2_4a" => 1.0,
-        "floyd_steinberg" => 1.08,
-        _ => 1.0,
-    }
-}
-
-fn dither_quality_factor(dither: &str) -> f64 {
-    match dither {
-        "floyd_steinberg" => 1.0,
-        "sierra2_4a" => 0.96,
-        "bayer" => 0.82,
-        "none" => 0.68,
-        _ => 0.9,
-    }
 }
 
 fn predict_target_width(
@@ -1958,7 +1932,7 @@ mod tests {
     }
 
     #[test]
-    fn compression_candidates_trade_more_than_width() {
+    fn compression_candidates_trade_size_without_changing_dither() {
         let request = NormalizedExportRequest {
             render: NormalizedRenderSettings {
                 source_path: PathBuf::from("input.mp4"),
@@ -1992,6 +1966,6 @@ mod tests {
             .any(|candidate| candidate.request.render.colors < request.render.colors));
         assert!(candidates
             .iter()
-            .any(|candidate| candidate.request.render.dither == "bayer"));
+            .all(|candidate| candidate.request.render.dither == request.render.dither));
     }
 }
