@@ -25,12 +25,12 @@
   --error: #9d2d27;
   --ok: #2d7b47;
   --shadow: 0 16px 32px rgba(70, 46, 24, 0.08);
-  --radius-control: 8px;
-  --radius-panel: 8px;
-  --radius-card: 10px;
-  --radius-stage: 10px;
-  --radius-chip: 7px;
-  --radius-handle: 5px;
+  --radius-control: 4px;
+  --radius-panel: 4px;
+  --radius-card: 6px;
+  --radius-stage: 6px;
+  --radius-chip: 4px;
+  --radius-handle: 2px;
 }
 
 * {
