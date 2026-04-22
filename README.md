@@ -7,7 +7,9 @@ controllable GIFs. It is built with Tauri, React, TypeScript, and FFmpeg.
 
 ## Features
 
-- Open local video files with a native Windows file picker.
+- Open one or many local video files with a native Windows file picker.
+- Batch export selected videos from a thumbnail rail with per-video checkboxes.
+- Edit export settings per video, or enable global settings to share output controls across the whole batch.
 - Preview the source video and inspect an output-quality frame in the main stage.
 - Zoom the preview with the mouse wheel and scroll around when zoomed in.
 - Trim the exported range.

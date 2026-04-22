@@ -63,12 +63,13 @@ import {
   isDesktopApp,
   loadFfmpegStatus,
   pickGifOutputPath,
-  pickVideoPath,
+  pickVideoPaths,
   renderGifPreview,
 } from "./lib/native";
 import type {
   CropRegion,
   EditorProject,
+  ExportSettings,
   FfmpegStatus,
   GifExportResult,
   GifPreviewResult,
@@ -83,6 +84,14 @@ const AUTO_TEST_SOURCE_PATH =
 
 type EditorMode = "crop" | "shape";
 type ArrowEndpoint = "start" | "end";
+
+type BatchVideo = {
+  id: string;
+  project: EditorProject;
+  outputPath: string;
+  selectedForExport: boolean;
+  lastExportResult: GifExportResult | null;
+};
 
 type InteractionState =
   | {
@@ -221,6 +230,92 @@ function shouldReuseProjectForInspection(
     previousProject.source.fileName === inspection.fileName &&
     previousProject.source.fileSizeBytes === inspection.fileSizeBytes
   );
+}
+
+function createBatchVideoId(): string {
+  return globalThis.crypto?.randomUUID?.() ?? `video-${Date.now()}-${Math.random()}`;
+}
+
+function getProjectKey(project: EditorProject): string {
+  if (project.source.sourcePath) {
+    return `path:${project.source.sourcePath.trim().toLocaleLowerCase()}`;
+  }
+
+  return `file:${project.source.fileName}:${project.source.fileSizeBytes ?? "unknown"}`;
+}
+
+function applySharedOutputSettings(
+  project: EditorProject,
+  exportSettings: ExportSettings,
+  trim?: TrimRange,
+): EditorProject {
+  const nextProject = {
+    ...project,
+    export: {
+      ...exportSettings,
+      width: project.inspection
+        ? Math.min(exportSettings.width, project.inspection.width)
+        : exportSettings.width,
+    },
+  };
+
+  if (!trim || !nextProject.inspection) {
+    return nextProject;
+  }
+
+  return {
+    ...nextProject,
+    trim: clampTrim(trim, nextProject.inspection.durationSeconds),
+  };
+}
+
+function buildProjectFromInspection(
+  inspection: VideoInspection,
+  requestedPath: string,
+  previousProject: EditorProject | null,
+  sharedExportSettings: ExportSettings | null,
+  sharedTrim: TrimRange | null,
+): EditorProject {
+  const sourcePath = inspection.sourcePath ?? requestedPath;
+  const resolvedInspection = {
+    ...inspection,
+    sourcePath,
+  };
+
+  const previewUrl = previousProject?.source.previewUrl ?? getPreviewUrlForPath(sourcePath);
+  const draft =
+    shouldReuseProjectForInspection(previousProject, resolvedInspection) && previousProject
+      ? {
+          ...previousProject,
+          source: {
+            ...previousProject.source,
+            previewUrl,
+            sourcePath,
+            fileName: inspection.fileName,
+            fileSizeBytes: inspection.fileSizeBytes ?? previousProject.source.fileSizeBytes,
+          },
+        }
+      : buildDraftProject({
+          fileName: inspection.fileName,
+          previewUrl,
+          sourcePath,
+          fileSizeBytes: inspection.fileSizeBytes ?? null,
+        });
+
+  const inspectedProject = applyInspectionToProject(draft, resolvedInspection);
+  return sharedExportSettings
+    ? applySharedOutputSettings(inspectedProject, sharedExportSettings, sharedTrim ?? undefined)
+    : inspectedProject;
+}
+
+function createBatchVideo(project: EditorProject, selectedForExport = true): BatchVideo {
+  return {
+    id: createBatchVideoId(),
+    project,
+    outputPath: buildDefaultOutputPath(project.source.sourcePath, project.source.fileName),
+    selectedForExport,
+    lastExportResult: null,
+  };
 }
 
 function rectFromCrop(crop: CropRegion): NormalizedRect {
@@ -458,7 +553,7 @@ function renderShapeHitTarget(
 function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const previewVideoRef = useRef<HTMLVideoElement | null>(null);
-  const previewObjectUrlRef = useRef<string | null>(null);
+  const previewObjectUrlsRef = useRef<string[]>([]);
   const qualityPreviewRequestIdRef = useRef(0);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const pendingZoomAnchorRef = useRef<{
@@ -467,17 +562,18 @@ function App() {
     viewportX: number;
     viewportY: number;
   } | null>(null);
-  const lastAutoOutputPathRef = useRef("");
   const didAutoLoadTestSourceRef = useRef(false);
-  const [project, setProject] = useState<EditorProject | null>(null);
+  const [batchVideos, setBatchVideos] = useState<BatchVideo[]>([]);
+  const [activeVideoId, setActiveVideoId] = useState<string | null>(null);
+  const [useGlobalOutputSettings, setUseGlobalOutputSettings] = useState(false);
+  const [globalOutputSettings, setGlobalOutputSettings] = useState<ExportSettings | null>(null);
+  const [globalTrim, setGlobalTrim] = useState<TrimRange | null>(null);
   const [ffmpegStatus, setFfmpegStatus] = useState<FfmpegStatus | null>(null);
   const [selectedShapeId, setSelectedShapeId] = useState<string | null>(null);
-  const [manualPath, setManualPath] = useState("");
-  const [outputPath, setOutputPath] = useState("");
   const [pathState, setPathState] = useState<"idle" | "loading">("idle");
   const [dragActive, setDragActive] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
-  const [lastExportResult, setLastExportResult] = useState<GifExportResult | null>(null);
+  const [exportProgress, setExportProgress] = useState<{ current: number; total: number } | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [infoMessage, setInfoMessage] = useState<string | null>(null);
   const [editorMode, setEditorMode] = useState<EditorMode>("shape");
@@ -490,6 +586,10 @@ function App() {
   const [previewZoom, setPreviewZoom] = useState(1);
   const [playbackTime, setPlaybackTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
+  const activeVideo = batchVideos.find((video) => video.id === activeVideoId) ?? null;
+  const project = activeVideo?.project ?? null;
+  const outputPath = activeVideo?.outputPath ?? "";
+  const lastExportResult = activeVideo?.lastExportResult ?? null;
   const deferredPreviewProject = useDeferredValue(project);
 
   useEffect(() => {
@@ -508,44 +608,37 @@ function App() {
 
   useEffect(() => {
     return () => {
-      if (previewObjectUrlRef.current) {
-        URL.revokeObjectURL(previewObjectUrlRef.current);
-      }
+      previewObjectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+      previewObjectUrlsRef.current = [];
     };
   }, []);
 
   useEffect(() => {
-    if (!project) {
+    if (batchVideos.length === 0) {
+      if (activeVideoId) {
+        setActiveVideoId(null);
+      }
       return;
     }
 
-    const autoPath = buildDefaultOutputPath(project.source.sourcePath, project.source.fileName);
-
-    setOutputPath((previousPath) => {
-      if (!previousPath || previousPath === lastAutoOutputPathRef.current) {
-        return autoPath;
-      }
-
-      return previousPath;
-    });
-
-    lastAutoOutputPathRef.current = autoPath;
-  }, [project?.source.fileName, project?.source.sourcePath]);
+    if (!batchVideos.some((video) => video.id === activeVideoId)) {
+      setActiveVideoId(batchVideos[0].id);
+    }
+  }, [activeVideoId, batchVideos]);
 
   useEffect(() => {
     if (
       !AUTO_TEST_SOURCE_PATH ||
       didAutoLoadTestSourceRef.current ||
-      project ||
+      batchVideos.length > 0 ||
       pathState === "loading"
     ) {
       return;
     }
 
     didAutoLoadTestSourceRef.current = true;
-    setManualPath(AUTO_TEST_SOURCE_PATH);
-    void loadSourcePath(AUTO_TEST_SOURCE_PATH);
-  }, [pathState, project]);
+    void loadSourcePaths([AUTO_TEST_SOURCE_PATH]);
+  }, [batchVideos.length, pathState]);
 
   useEffect(() => {
     if (selectedShapeId && !project?.markup.some((shape) => shape.id === selectedShapeId)) {
@@ -592,13 +685,12 @@ function App() {
       return;
     }
 
-    const firstPath = event.payload.paths?.[0];
-    if (!firstPath) {
+    const paths = event.payload.paths?.filter((path) => path.trim()) ?? [];
+    if (paths.length === 0) {
       return;
     }
 
-    setManualPath(firstPath);
-    void loadSourcePath(firstPath);
+    void loadSourcePaths(paths);
   });
 
   useEffect(() => {
@@ -688,47 +780,129 @@ function App() {
     };
   }, [deferredPreviewProject, ffmpegStatus?.available, isExporting, qualityPreviewFrameTime]);
 
-  function replacePreviewObjectUrl(nextUrl: string | null) {
-    if (previewObjectUrlRef.current) {
-      URL.revokeObjectURL(previewObjectUrlRef.current);
-      previewObjectUrlRef.current = null;
+  function updateActiveProject(updater: (previousProject: EditorProject) => EditorProject) {
+    if (!activeVideoId) {
+      return;
     }
 
-    previewObjectUrlRef.current = nextUrl;
+    setBatchVideos((previousVideos) =>
+      previousVideos.map((video) =>
+        video.id === activeVideoId
+          ? {
+              ...video,
+              project: updater(video.project),
+            }
+          : video,
+      ),
+    );
   }
 
-  function createPreviewProject(file: File) {
-    replacePreviewObjectUrl(URL.createObjectURL(file));
-    const sourcePath = project?.source.sourcePath ?? (manualPath.trim() || null);
+  function updateActiveOutputPath(nextOutputPath: string) {
+    if (!activeVideoId) {
+      return;
+    }
 
-    const nextProject = buildDraftProject({
+    setBatchVideos((previousVideos) =>
+      previousVideos.map((video) =>
+        video.id === activeVideoId
+          ? {
+              ...video,
+              outputPath: nextOutputPath,
+              lastExportResult:
+                nextOutputPath === video.lastExportResult?.outputPath ? video.lastExportResult : null,
+            }
+          : video,
+      ),
+    );
+  }
+
+  function selectBatchVideo(videoId: string) {
+    if (videoId === activeVideoId) {
+      return;
+    }
+
+    setActiveVideoId(videoId);
+    setSelectedShapeId(null);
+    setInteraction(null);
+  }
+
+  function toggleBatchVideoExport(videoId: string, selectedForExport: boolean) {
+    setBatchVideos((previousVideos) =>
+      previousVideos.map((video) =>
+        video.id === videoId
+          ? {
+              ...video,
+              selectedForExport,
+            }
+          : video,
+      ),
+    );
+  }
+
+  function setGlobalOutputSettingsEnabled(enabled: boolean) {
+    setUseGlobalOutputSettings(enabled);
+
+    if (!enabled) {
+      setGlobalOutputSettings(null);
+      setGlobalTrim(null);
+      return;
+    }
+
+    if (!project) {
+      return;
+    }
+
+    const sharedExportSettings = project.export;
+    const sharedTrim = project.trim;
+    setGlobalOutputSettings(sharedExportSettings);
+    setGlobalTrim(sharedTrim);
+    setBatchVideos((previousVideos) =>
+      previousVideos.map((video) => ({
+        ...video,
+        project: applySharedOutputSettings(video.project, sharedExportSettings, sharedTrim),
+      })),
+    );
+  }
+
+  function createPreviewBatchVideo(file: File) {
+    const objectUrl = URL.createObjectURL(file);
+    previewObjectUrlsRef.current.push(objectUrl);
+
+    let nextProject = buildDraftProject({
       fileName: file.name,
-      previewUrl: previewObjectUrlRef.current,
-      sourcePath,
+      previewUrl: objectUrl,
+      sourcePath: null,
       fileSizeBytes: file.size,
     });
 
-    setProject(nextProject);
-    setSelectedShapeId(null);
-    setErrorMessage(null);
-    setInfoMessage("Preview loaded.");
+    if (useGlobalOutputSettings && project) {
+      nextProject = applySharedOutputSettings(
+        nextProject,
+        globalOutputSettings ?? project.export,
+        globalTrim ?? project.trim,
+      );
+    }
+
+    return createBatchVideo(nextProject);
   }
 
-  function importPreviewFile(file: File | null | undefined) {
-    if (!file) {
+  function importPreviewFiles(files: FileList | File[] | null | undefined) {
+    const videoFiles = Array.from(files ?? []).filter((file) => file.type.startsWith("video/"));
+    if (videoFiles.length === 0) {
+      setErrorMessage("Select real video files such as MP4, MOV, WEBM, or MKV.");
       return;
     }
 
-    if (!file.type.startsWith("video/")) {
-      setErrorMessage("Drop or select a real video file such as MP4, MOV, WEBM, or MKV.");
-      return;
-    }
-
-    createPreviewProject(file);
+    const nextVideos = videoFiles.map(createPreviewBatchVideo);
+    setBatchVideos((previousVideos) => [...previousVideos, ...nextVideos]);
+    setActiveVideoId(nextVideos[0].id);
+    setSelectedShapeId(null);
+    setErrorMessage(null);
+    setInfoMessage(nextVideos.length === 1 ? "Preview loaded." : `${nextVideos.length} previews loaded.`);
   }
 
   function onFileInputChange(event: ChangeEvent<HTMLInputElement>) {
-    importPreviewFile(event.currentTarget.files?.[0]);
+    importPreviewFiles(event.currentTarget.files);
     event.currentTarget.value = "";
   }
 
@@ -746,56 +920,96 @@ function App() {
     event.preventDefault();
     setDragActive(false);
 
-    const files = Array.from(event.dataTransfer.files);
-    const videoFile = files.find((file) => file.type.startsWith("video/"));
-    importPreviewFile(videoFile);
+    importPreviewFiles(event.dataTransfer.files);
   }
 
-  async function loadSourcePath(pathToLoad: string) {
-    const trimmedPath = pathToLoad.trim();
-    if (!trimmedPath) {
-      setErrorMessage("Paste a full Windows path before loading the source.");
+  async function loadSourcePaths(pathsToLoad: string[]) {
+    const cleanedPaths = Array.from(
+      new Set(pathsToLoad.map((path) => path.trim().replace(/^"(.*)"$/, "$1")).filter(Boolean)),
+    );
+    if (cleanedPaths.length === 0) {
+      setErrorMessage("Choose at least one video source.");
       return;
     }
 
     setPathState("loading");
     setErrorMessage(null);
 
-    try {
-      const inspection = await inspectVideoPath(trimmedPath);
+    const sharedExportSettings = useGlobalOutputSettings
+      ? globalOutputSettings ?? project?.export ?? null
+      : null;
+    const sharedTrim = useGlobalOutputSettings ? globalTrim ?? project?.trim ?? null : null;
+    const nextVideos: BatchVideo[] = [];
+    const failures: string[] = [];
 
-      setProject((previousProject) => {
-        const draft =
-          shouldReuseProjectForInspection(previousProject, inspection) && previousProject
-            ? {
-                ...previousProject,
-                source: {
-                  ...previousProject.source,
-                  sourcePath: inspection.sourcePath,
-                  fileName: inspection.fileName,
-                  fileSizeBytes:
-                    inspection.fileSizeBytes ?? previousProject.source.fileSizeBytes,
-                },
-              }
-            : buildDraftProject({
-                fileName: inspection.fileName,
-                previewUrl: null,
-                sourcePath: inspection.sourcePath,
-                fileSizeBytes: inspection.fileSizeBytes ?? null,
-              });
+    for (const pathToLoad of cleanedPaths) {
+      try {
+        const inspection = await inspectVideoPath(pathToLoad);
+        const sourcePath = inspection.sourcePath ?? pathToLoad;
+        const previousVideo =
+          batchVideos.find(
+            (video) =>
+              video.project.source.sourcePath?.trim().toLocaleLowerCase() ===
+              sourcePath.trim().toLocaleLowerCase(),
+          ) ?? null;
+        const nextProject = buildProjectFromInspection(
+          inspection,
+          pathToLoad,
+          previousVideo?.project ?? null,
+          sharedExportSettings,
+          sharedTrim,
+        );
+        const nextVideo = createBatchVideo(nextProject, previousVideo?.selectedForExport ?? true);
 
-        return applyInspectionToProject(draft, inspection);
-      });
+        if (previousVideo) {
+          nextVideo.id = previousVideo.id;
+          nextVideo.outputPath = previousVideo.outputPath || nextVideo.outputPath;
+          nextVideo.lastExportResult = previousVideo.lastExportResult;
+        }
 
-      setManualPath(inspection.sourcePath ?? trimmedPath);
-      setLastExportResult(null);
-      setInfoMessage("Source metadata loaded.");
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Unable to inspect the selected source.";
-      setErrorMessage(message);
-    } finally {
-      setPathState("idle");
+        nextVideos.push(nextVideo);
+      } catch (error) {
+        failures.push(error instanceof Error ? error.message : `Unable to inspect ${pathToLoad}.`);
+      }
     }
+
+    if (nextVideos.length > 0) {
+      setBatchVideos((previousVideos) => {
+        const mergedVideos = [...previousVideos];
+
+        for (const nextVideo of nextVideos) {
+          const existingIndex = mergedVideos.findIndex(
+            (video) => video.id === nextVideo.id || getProjectKey(video.project) === getProjectKey(nextVideo.project),
+          );
+
+          if (existingIndex >= 0) {
+            mergedVideos[existingIndex] = {
+              ...mergedVideos[existingIndex],
+              ...nextVideo,
+            };
+          } else {
+            mergedVideos.push(nextVideo);
+          }
+        }
+
+        return mergedVideos;
+      });
+      setActiveVideoId(nextVideos[0].id);
+      setSelectedShapeId(null);
+      setInfoMessage(
+        nextVideos.length === 1 ? "Source metadata loaded." : `${nextVideos.length} videos loaded.`,
+      );
+    }
+
+    if (failures.length > 0) {
+      setErrorMessage(
+        nextVideos.length > 0
+          ? `${failures.length} video${failures.length === 1 ? "" : "s"} skipped. ${failures[0]}`
+          : failures[0],
+      );
+    }
+
+    setPathState("idle");
   }
 
   async function onOpenVideoSource() {
@@ -805,13 +1019,12 @@ function App() {
     }
 
     try {
-      const selectedPath = await pickVideoPath();
-      if (!selectedPath) {
+      const selectedPaths = await pickVideoPaths();
+      if (selectedPaths.length === 0) {
         return;
       }
 
-      setManualPath(selectedPath);
-      await loadSourcePath(selectedPath);
+      await loadSourcePaths(selectedPaths);
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Could not open the video picker.";
@@ -830,7 +1043,7 @@ function App() {
       );
 
       if (selectedPath) {
-        setOutputPath(selectedPath);
+        updateActiveOutputPath(selectedPath);
       }
     } catch (error) {
       const message =
@@ -840,8 +1053,9 @@ function App() {
   }
 
   async function onExportGif() {
-    if (!project?.source.sourcePath) {
-      setErrorMessage("Load a real source path before exporting.");
+    const videosToExport = batchVideos.filter((video) => video.selectedForExport);
+    if (videosToExport.length === 0) {
+      setErrorMessage("Check at least one video in the batch before exporting.");
       return;
     }
 
@@ -850,27 +1064,83 @@ function App() {
       return;
     }
 
-    const resolvedOutputPath =
-      outputPath.trim() || buildDefaultOutputPath(project.source.sourcePath, project.source.fileName);
+    const missingSource = videosToExport.find((video) => !video.project.source.sourcePath);
+    if (missingSource) {
+      setErrorMessage(`${missingSource.project.source.fileName} needs a real source path before export.`);
+      return;
+    }
 
     setIsExporting(true);
+    setExportProgress({ current: 0, total: videosToExport.length });
     setErrorMessage(null);
-    setInfoMessage(project.markup.length > 0 ? "Exporting GIF with overlay..." : "Exporting GIF...");
+    setInfoMessage(
+      videosToExport.length === 1
+        ? "Exporting GIF..."
+        : `Exporting 1/${videosToExport.length} GIFs...`,
+    );
 
+    const results: GifExportResult[] = [];
+    const failures: string[] = [];
     try {
-      const overlayPngDataUrl = renderMarkupOverlayPng(project);
-      const result = await exportGif(
-        buildGifExportRequest(project, resolvedOutputPath, overlayPngDataUrl),
-      );
+      for (let index = 0; index < videosToExport.length; index += 1) {
+        const video = videosToExport[index];
+        const resolvedOutputPath =
+          video.outputPath.trim() ||
+          buildDefaultOutputPath(video.project.source.sourcePath, video.project.source.fileName);
 
-      setOutputPath(result.outputPath);
-      setLastExportResult(result);
-      setInfoMessage(`Exported ${formatBytes(result.fileSizeBytes)}`);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "GIF export failed.";
-      setErrorMessage(message);
+        setExportProgress({ current: index + 1, total: videosToExport.length });
+        setInfoMessage(
+          videosToExport.length === 1
+            ? "Exporting GIF..."
+            : `Exporting ${index + 1}/${videosToExport.length}: ${video.project.source.fileName}`,
+        );
+
+        try {
+          const overlayPngDataUrl = renderMarkupOverlayPng(video.project);
+          const result = await exportGif(
+            buildGifExportRequest(video.project, resolvedOutputPath, overlayPngDataUrl),
+          );
+
+          results.push(result);
+          setBatchVideos((previousVideos) =>
+            previousVideos.map((previousVideo) =>
+              previousVideo.id === video.id
+                ? {
+                    ...previousVideo,
+                    outputPath: result.outputPath,
+                    lastExportResult: result,
+                  }
+                : previousVideo,
+            ),
+          );
+        } catch (error) {
+          failures.push(
+            `${video.project.source.fileName}: ${
+              error instanceof Error ? error.message : "GIF export failed."
+            }`,
+          );
+        }
+      }
+
+      if (results.length > 0) {
+        const knownTotalBytes = results.every((result) => result.fileSizeBytes !== null)
+          ? results.reduce((total, result) => total + (result.fileSizeBytes ?? 0), 0)
+          : null;
+        setInfoMessage(
+          results.length === 1
+            ? `Exported ${formatBytes(results[0].fileSizeBytes)}`
+            : `Exported ${results.length} GIFs (${formatBytes(knownTotalBytes)})`,
+        );
+      }
+
+      if (failures.length > 0) {
+        setErrorMessage(
+          `${failures.length} export${failures.length === 1 ? "" : "s"} failed. ${failures[0]}`,
+        );
+      }
     } finally {
       setIsExporting(false);
+      setExportProgress(null);
     }
   }
 
@@ -969,11 +1239,7 @@ function App() {
   const handleVideoMetadata = useEffectEvent((event: SyntheticEvent<HTMLVideoElement>) => {
     const videoElement = event.currentTarget;
 
-    setProject((previousProject) => {
-      if (!previousProject) {
-        return previousProject;
-      }
-
+    updateActiveProject((previousProject) => {
       const inspection = buildHtmlVideoInspection(previousProject, videoElement);
       if (!inspection) {
         return previousProject;
@@ -990,24 +1256,41 @@ function App() {
   });
 
   function updateCrop(patch: Partial<CropRegion>) {
-    setProject((previousProject) => {
-      if (!previousProject) {
-        return previousProject;
-      }
-
-      return {
-        ...previousProject,
-        crop: clampCrop({
-          ...previousProject.crop,
-          ...patch,
-        }),
-      };
-    });
+    updateActiveProject((previousProject) => ({
+      ...previousProject,
+      crop: clampCrop({
+        ...previousProject.crop,
+        ...patch,
+      }),
+    }));
   }
 
   function updateTrim(patch: Partial<TrimRange>) {
-    setProject((previousProject) => {
-      if (!previousProject || !previousProject.inspection) {
+    if (useGlobalOutputSettings && project?.inspection) {
+      const sharedTrim = {
+        ...(globalTrim ?? project.trim),
+        ...patch,
+      };
+
+      setGlobalTrim(sharedTrim);
+      setBatchVideos((previousVideos) =>
+        previousVideos.map((video) =>
+          video.project.inspection
+            ? {
+                ...video,
+                project: {
+                  ...video.project,
+                  trim: clampTrim(sharedTrim, video.project.inspection.durationSeconds),
+                },
+              }
+            : video,
+        ),
+      );
+      return;
+    }
+
+    updateActiveProject((previousProject) => {
+      if (!previousProject.inspection) {
         return previousProject;
       }
 
@@ -1028,45 +1311,75 @@ function App() {
     key: K,
     value: EditorProject["export"][K],
   ) {
-    setProject((previousProject) => {
-      if (!previousProject) {
-        return previousProject;
-      }
+    if (!project) {
+      return;
+    }
 
-      return {
-        ...previousProject,
-        export: {
-          ...previousProject.export,
-          [key]: value,
-        },
+    const nextExportSettings = {
+      ...(globalOutputSettings ?? project.export),
+      [key]: value,
+    };
+
+    if (useGlobalOutputSettings) {
+      setGlobalOutputSettings(nextExportSettings);
+      setBatchVideos((previousVideos) =>
+        previousVideos.map((video) => ({
+          ...video,
+          project: applySharedOutputSettings(video.project, nextExportSettings),
+        })),
+      );
+      return;
+    }
+
+    updateActiveProject((previousProject) => ({
+      ...previousProject,
+      export: nextExportSettings,
+    }));
+  }
+
+  function applyExportPreset(presetId: keyof typeof EXPORT_PRESETS) {
+    if (useGlobalOutputSettings) {
+      const preset = EXPORT_PRESETS[presetId];
+      const previousExportSettings = globalOutputSettings ?? project?.export;
+      const nextExportSettings: ExportSettings = {
+        presetId: preset.presetId,
+        width: preset.width,
+        fps: preset.fps,
+        colors: preset.colors,
+        dither: preset.dither,
+        loop: preset.loop,
+        useSourceResolution: previousExportSettings?.useSourceResolution ?? false,
+        targetFileSizeEnabled: previousExportSettings?.targetFileSizeEnabled ?? false,
+        targetFileSizeMb: previousExportSettings?.targetFileSizeMb ?? 4,
       };
-    });
+
+      setGlobalOutputSettings(nextExportSettings);
+      setBatchVideos((previousVideos) =>
+        previousVideos.map((video) => ({
+          ...video,
+          project: applySharedOutputSettings(video.project, nextExportSettings),
+        })),
+      );
+      return;
+    }
+
+    updateActiveProject((previousProject) => updateExportPreset(previousProject, presetId));
   }
 
   function updateShapeById(
     shapeId: string,
     patch: Partial<Omit<MarkupShape, "id" | "kind">>,
   ) {
-    setProject((previousProject) => {
-      if (!previousProject) {
-        return previousProject;
-      }
-
-      return {
-        ...previousProject,
-        markup: previousProject.markup.map((shape) =>
-          shape.id === shapeId ? clampShape({ ...shape, ...patch }) : shape,
-        ),
-      };
-    });
+    updateActiveProject((previousProject) => ({
+      ...previousProject,
+      markup: previousProject.markup.map((shape) =>
+        shape.id === shapeId ? clampShape({ ...shape, ...patch }) : shape,
+      ),
+    }));
   }
 
   function addShape(kind: ShapeKind) {
-    setProject((previousProject) => {
-      if (!previousProject) {
-        return previousProject;
-      }
-
+    updateActiveProject((previousProject) => {
       const nextProject = addMarkupShape(previousProject, kind);
       setSelectedShapeId(nextProject.markup[nextProject.markup.length - 1]?.id ?? null);
       setEditorMode("shape");
@@ -1075,8 +1388,8 @@ function App() {
   }
 
   function removeSelectedShape() {
-    setProject((previousProject) => {
-      if (!previousProject || !selectedShapeId) {
+    updateActiveProject((previousProject) => {
+      if (!selectedShapeId) {
         return previousProject;
       }
 
@@ -1092,9 +1405,15 @@ function App() {
   const outputDimensions = project ? getOutputDimensions(project) : null;
   const sourceOutputDimensions = project ? getSourceOutputDimensions(project) : null;
   const estimatedGifBytes = project ? estimateGifSizeBytes(project) : null;
+  const videosSelectedForExport = batchVideos.filter((video) => video.selectedForExport);
+  const exportableVideoCount = videosSelectedForExport.filter(
+    (video) => video.project.inspection && video.project.source.sourcePath,
+  ).length;
+  const hasCheckedVideos = videosSelectedForExport.length > 0;
+  const checkedVideosAreExportable = exportableVideoCount === videosSelectedForExport.length;
   const canPrepareExport =
-    Boolean(project?.inspection) &&
-    Boolean(project?.source.sourcePath) &&
+    hasCheckedVideos &&
+    checkedVideosAreExportable &&
     Boolean(ffmpegStatus?.available);
   const selectedShape =
     project?.markup.find((shape) => shape.id === selectedShapeId) ?? null;
@@ -1256,20 +1575,14 @@ function App() {
       }
 
       if (activeInteraction.kind === "crop-move" || activeInteraction.kind === "crop-resize") {
-        setProject((previousProject) => {
-          if (!previousProject) {
-            return previousProject;
-          }
-
-          return {
-            ...previousProject,
-            crop: clampCrop({
-              ...previousProject.crop,
-              enabled: true,
-              ...nextRect,
-            }),
-          };
-        });
+        updateActiveProject((previousProject) => ({
+          ...previousProject,
+          crop: clampCrop({
+            ...previousProject.crop,
+            enabled: true,
+            ...nextRect,
+          }),
+        }));
 
         return;
       }
@@ -1512,9 +1825,66 @@ function App() {
             </div>
           </div>
 
-          <div ref={stageRef} className="preview-stage">
-            {previewUrl ? (
-              <>
+          <div className="stage-main">
+            <aside className="batch-rail" aria-label="Loaded videos">
+              <div className="batch-rail-head">
+                <span>Batch</span>
+                <strong>{batchVideos.length}</strong>
+              </div>
+              <div className="batch-list">
+                {batchVideos.length > 0 ? (
+                  batchVideos.map((video) => {
+                    const thumbnailUrl =
+                      video.project.source.previewUrl ??
+                      getPreviewUrlForPath(video.project.source.sourcePath);
+
+                    return (
+                      <div
+                        key={video.id}
+                        className={`batch-thumb-card ${video.id === activeVideoId ? "selected" : ""}`}
+                      >
+                        <button
+                          type="button"
+                          className="batch-thumb-button"
+                          onClick={() => selectBatchVideo(video.id)}
+                          title={video.project.source.fileName}
+                        >
+                          {thumbnailUrl ? (
+                            <video
+                              className="batch-thumb-video"
+                              src={thumbnailUrl}
+                              preload="metadata"
+                              muted
+                              aria-hidden="true"
+                            />
+                          ) : (
+                            <span className="batch-thumb-fallback">GIF</span>
+                          )}
+                          <span className="batch-thumb-name">
+                            {truncateMiddle(video.project.source.fileName, 9, 5)}
+                          </span>
+                        </button>
+                        <input
+                          className="batch-thumb-check"
+                          type="checkbox"
+                          checked={video.selectedForExport}
+                          onChange={(event) =>
+                            toggleBatchVideoExport(video.id, event.currentTarget.checked)
+                          }
+                          aria-label={`Export ${video.project.source.fileName}`}
+                        />
+                      </div>
+                    );
+                  })
+                ) : (
+                  <div className="batch-empty">Open videos</div>
+                )}
+              </div>
+            </aside>
+
+            <div ref={stageRef} className="preview-stage">
+              {previewUrl ? (
+                <>
                 <div
                   className="preview-canvas"
                   style={{
@@ -1856,12 +2226,13 @@ function App() {
                     </div>
                   </div>
                 </div>
-              </>
-            ) : (
-              <div className="empty-preview">
-                <p>Open a video.</p>
-              </div>
-            )}
+                </>
+              ) : (
+                <div className="empty-preview">
+                  <p>Open a video.</p>
+                </div>
+              )}
+            </div>
           </div>
 
           <div className="stage-footer">
@@ -1902,6 +2273,7 @@ function App() {
             ref={fileInputRef}
             type="file"
             accept="video/*"
+            multiple
             className="hidden-input"
             onChange={onFileInputChange}
           />
@@ -2056,13 +2428,7 @@ function App() {
                     key={presetId}
                     type="button"
                     className={`preset-card ${project?.export.presetId === presetId ? "selected" : ""}`}
-                    onClick={() =>
-                      setProject((previousProject) =>
-                        previousProject
-                          ? updateExportPreset(previousProject, presetId as keyof typeof EXPORT_PRESETS)
-                          : previousProject,
-                      )
-                    }
+                    onClick={() => applyExportPreset(presetId as keyof typeof EXPORT_PRESETS)}
                   >
                     <strong>{preset.label}</strong>
                     <span>{preset.width}px | {preset.fps} fps</span>
@@ -2164,6 +2530,16 @@ function App() {
               </div>
 
               <div className="toggle-stack export-toggle-stack">
+                <label className="toggle-row global-toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={useGlobalOutputSettings}
+                    onChange={(event) => setGlobalOutputSettingsEnabled(event.currentTarget.checked)}
+                    disabled={batchVideos.length < 2}
+                  />
+                  <span>Global settings</span>
+                </label>
+
                 <label className="toggle-row">
                   <input
                     type="checkbox"
@@ -2242,7 +2618,7 @@ function App() {
                   <input
                     id="output-path"
                     value={outputPath}
-                    onChange={(event) => setOutputPath(event.currentTarget.value)}
+                    onChange={(event) => updateActiveOutputPath(event.currentTarget.value)}
                     placeholder="C:\\Users\\you\\Videos\\clip-windgifs.gif"
                   />
                   <button type="button" onClick={onChooseOutputPath} disabled={!project}>
@@ -2255,7 +2631,7 @@ function App() {
                     className="ghost-button"
                     onClick={() =>
                       project &&
-                      setOutputPath(
+                      updateActiveOutputPath(
                         buildDefaultOutputPath(project.source.sourcePath, project.source.fileName),
                       )
                     }
@@ -2281,14 +2657,24 @@ function App() {
                   onClick={onExportGif}
                   disabled={!canPrepareExport || isExporting}
                 >
-                  {isExporting ? "Exporting..." : "Export GIF"}
+                  {isExporting && exportProgress
+                    ? `Exporting ${Math.max(1, exportProgress.current)}/${exportProgress.total}`
+                    : videosSelectedForExport.length > 1
+                      ? `Export ${videosSelectedForExport.length} GIFs`
+                      : "Export GIF"}
                 </button>
                 <p>
                   {lastExportResult
                     ? `Last export: ${formatBytes(lastExportResult.fileSizeBytes)}`
                     : canPrepareExport
-                      ? "Ready."
-                      : "Open a video to export."}
+                      ? `${videosSelectedForExport.length} selected.`
+                      : !hasCheckedVideos && batchVideos.length > 0
+                        ? "Check videos to export."
+                        : hasCheckedVideos && !checkedVideosAreExportable
+                          ? "Loaded previews need source paths."
+                          : hasCheckedVideos && !ffmpegStatus?.available
+                            ? "FFmpeg unavailable."
+                            : "Open videos to export."}
                 </p>
               </div>
             </div>

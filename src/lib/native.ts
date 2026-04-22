@@ -84,13 +84,13 @@ export async function renderGifPreview(request: GifPreviewRequest): Promise<GifP
   return invoke<GifPreviewResult>("render_quality_preview", { request });
 }
 
-export async function pickVideoPath(): Promise<string | null> {
+export async function pickVideoPaths(): Promise<string[]> {
   if (!isDesktopApp()) {
-    return null;
+    return [];
   }
 
   const selected = await open({
-    multiple: false,
+    multiple: true,
     directory: false,
     filters: [
       {
@@ -100,7 +100,16 @@ export async function pickVideoPath(): Promise<string | null> {
     ],
   });
 
-  return typeof selected === "string" ? selected : null;
+  if (Array.isArray(selected)) {
+    return selected.filter((path): path is string => typeof path === "string");
+  }
+
+  return typeof selected === "string" ? [selected] : [];
+}
+
+export async function pickVideoPath(): Promise<string | null> {
+  const [selectedPath] = await pickVideoPaths();
+  return selectedPath ?? null;
 }
 
 export async function pickGifOutputPath(defaultPath: string): Promise<string | null> {

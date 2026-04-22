@@ -100,7 +100,7 @@ textarea {
 }
 
 .app-shell {
-  width: min(1040px, calc(100vw - 12px));
+  width: min(1100px, calc(100vw - 12px));
   margin: 0 auto;
   min-height: 100vh;
   height: 100vh;
@@ -241,6 +241,144 @@ textarea {
   grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 8px;
   min-height: 0;
+}
+
+.stage-main {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: 6px;
+  min-height: 0;
+}
+
+.batch-rail {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 6px;
+  min-height: 0;
+  padding: 5px;
+  overflow: hidden;
+  border-radius: var(--radius-stage);
+  border: 1px solid rgba(28, 36, 48, 0.11);
+  background: rgba(255, 255, 255, 0.5);
+}
+
+.batch-rail-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.74rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.batch-rail-head strong {
+  color: var(--ink);
+}
+
+.batch-list {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 1px;
+}
+
+.batch-thumb-card {
+  position: relative;
+  height: 62px;
+  overflow: hidden;
+  border-radius: var(--radius-panel);
+  border: 1px solid rgba(28, 36, 48, 0.14);
+  background: #10131a;
+}
+
+.batch-thumb-card.selected {
+  border-color: rgba(195, 95, 51, 0.72);
+  box-shadow: 0 0 0 1px rgba(195, 95, 51, 0.2);
+}
+
+.batch-thumb-button {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  text-align: left;
+}
+
+.batch-thumb-button:hover:not(:disabled) {
+  transform: none;
+  box-shadow: none;
+}
+
+.batch-thumb-video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  pointer-events: none;
+  background: #10131a;
+}
+
+.batch-thumb-fallback {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  color: rgba(255, 248, 241, 0.8);
+  font-size: 0.76rem;
+  font-weight: 800;
+}
+
+.batch-thumb-name {
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  bottom: 4px;
+  padding: 2px 4px;
+  overflow: hidden;
+  border-radius: var(--radius-chip);
+  background: rgba(7, 10, 15, 0.72);
+  color: #fff8f1;
+  font-size: 0.66rem;
+  font-weight: 700;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.batch-thumb-check {
+  position: absolute;
+  z-index: 2;
+  top: 4px;
+  right: 4px;
+  width: 16px;
+  min-height: 16px;
+  padding: 0;
+  accent-color: var(--accent);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.26);
+}
+
+.batch-empty {
+  display: grid;
+  place-items: center;
+  min-height: 62px;
+  padding: 8px;
+  border: 1px dashed rgba(28, 36, 48, 0.16);
+  border-radius: var(--radius-panel);
+  color: var(--muted);
+  font-size: 0.78rem;
+  text-align: center;
 }
 
 .export-card {
@@ -1129,6 +1267,21 @@ textarea {
   .stage-toolbar-actions,
   .footer-metrics {
     justify-content: start;
+  }
+
+  .stage-main {
+    grid-template-columns: 1fr;
+  }
+
+  .batch-rail {
+    min-height: 92px;
+  }
+
+  .batch-list {
+    grid-auto-flow: column;
+    grid-auto-columns: 82px;
+    overflow-x: auto;
+    overflow-y: hidden;
   }
 
   .path-row,
