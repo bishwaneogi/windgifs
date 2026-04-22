@@ -4,11 +4,11 @@ import {
   type DragEvent,
   type PointerEvent as ReactPointerEvent,
   type SyntheticEvent,
-  type WheelEvent as ReactWheelEvent,
   startTransition,
   useEffect,
   useDeferredValue,
   useEffectEvent,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
@@ -371,6 +371,10 @@ function buildPointStyle(point: Point): CSSProperties {
   };
 }
 
+function clampScrollPosition(value: number, max: number): number {
+  return Math.max(0, Math.min(value, Math.max(0, max)));
+}
+
 function buildCropEdgeStyle(crop: NormalizedRect, handle: "n" | "e" | "s" | "w"): CSSProperties {
   if (handle === "n") {
     return {
@@ -457,6 +461,12 @@ function App() {
   const previewObjectUrlRef = useRef<string | null>(null);
   const qualityPreviewRequestIdRef = useRef(0);
   const stageRef = useRef<HTMLDivElement | null>(null);
+  const pendingZoomAnchorRef = useRef<{
+    contentXRatio: number;
+    contentYRatio: number;
+    viewportX: number;
+    viewportY: number;
+  } | null>(null);
   const lastAutoOutputPathRef = useRef("");
   const didAutoLoadTestSourceRef = useRef(false);
   const [project, setProject] = useState<EditorProject | null>(null);
@@ -906,19 +916,48 @@ function App() {
     setQualityPreviewFrameTime(safeTime);
   }
 
-  function onStageWheel(event: ReactWheelEvent<HTMLDivElement>) {
+  const handleStageWheel = useEffectEvent((event: WheelEvent) => {
     if (!project?.inspection) {
       return;
     }
 
     event.preventDefault();
+    event.stopPropagation();
+
+    if (!stageRef.current || !stageViewport || event.deltaY === 0) {
+      return;
+    }
+
+    const bounds = stageRef.current.getBoundingClientRect();
+    pendingZoomAnchorRef.current = {
+      contentXRatio:
+        (stageRef.current.scrollLeft + event.clientX - bounds.left) / stageViewport.contentWidth,
+      contentYRatio:
+        (stageRef.current.scrollTop + event.clientY - bounds.top) / stageViewport.contentHeight,
+      viewportX: event.clientX - bounds.left,
+      viewportY: event.clientY - bounds.top,
+    };
 
     setPreviewZoom((currentZoom) => {
       const zoomDelta = event.deltaY < 0 ? 0.12 : -0.12;
       const nextZoom = Math.max(1, Math.min(4, Number((currentZoom + zoomDelta).toFixed(2))));
       return nextZoom;
     });
-  }
+  });
+
+  useEffect(() => {
+    const element = stageRef.current;
+    if (!element) {
+      return;
+    }
+
+    const onWheel = (event: WheelEvent) => handleStageWheel(event);
+    element.addEventListener("wheel", onWheel, { passive: false });
+
+    return () => {
+      element.removeEventListener("wheel", onWheel);
+    };
+  }, [handleStageWheel]);
 
   const syncQualityPreviewFrameTime = useEffectEvent(() => {
     const nextTime = resolveQualityPreviewFrameTime(project, previewVideoRef.current?.currentTime ?? null);
@@ -1123,16 +1162,31 @@ function App() {
       : null;
   const stageFrameTime = resolveQualityPreviewFrameTime(project, playbackTime);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const element = stageRef.current;
     if (!element || !stageViewport) {
       return;
     }
 
-    const nextScrollLeft = Math.max(0, (stageViewport.contentWidth - stageSize.width) / 2);
-    const nextScrollTop = Math.max(0, (stageViewport.contentHeight - stageSize.height) / 2);
-    element.scrollLeft = nextScrollLeft;
-    element.scrollTop = nextScrollTop;
+    const maxScrollLeft = stageViewport.contentWidth - stageSize.width;
+    const maxScrollTop = stageViewport.contentHeight - stageSize.height;
+    const zoomAnchor = pendingZoomAnchorRef.current;
+    pendingZoomAnchorRef.current = null;
+
+    if (zoomAnchor) {
+      element.scrollLeft = clampScrollPosition(
+        zoomAnchor.contentXRatio * stageViewport.contentWidth - zoomAnchor.viewportX,
+        maxScrollLeft,
+      );
+      element.scrollTop = clampScrollPosition(
+        zoomAnchor.contentYRatio * stageViewport.contentHeight - zoomAnchor.viewportY,
+        maxScrollTop,
+      );
+      return;
+    }
+
+    element.scrollLeft = clampScrollPosition((stageViewport.contentWidth - stageSize.width) / 2, maxScrollLeft);
+    element.scrollTop = clampScrollPosition((stageViewport.contentHeight - stageSize.height) / 2, maxScrollTop);
   }, [
     previewZoom,
     stageSize.height,
@@ -1458,7 +1512,7 @@ function App() {
             </div>
           </div>
 
-          <div ref={stageRef} className="preview-stage" onWheel={onStageWheel}>
+          <div ref={stageRef} className="preview-stage">
             {previewUrl ? (
               <>
                 <div

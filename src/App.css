@@ -337,6 +337,7 @@ textarea {
 .preview-stage {
   position: relative;
   overflow: auto;
+  overscroll-behavior: contain;
   border-radius: 18px;
   border: 1px solid rgba(28, 36, 48, 0.12);
   background:
