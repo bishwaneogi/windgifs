@@ -56,7 +56,7 @@ class AppErrorBoundary extends React.Component<
         <section
           style={{
             padding: 24,
-            borderRadius: 28,
+            borderRadius: 10,
             border: "1px solid rgba(157, 45, 39, 0.24)",
             background: "rgba(255, 252, 246, 0.96)",
             boxShadow: "0 28px 60px rgba(68, 46, 28, 0.12)",
@@ -83,7 +83,7 @@ class AppErrorBoundary extends React.Component<
             style={{
               margin: "18px 0 0",
               padding: 16,
-              borderRadius: 18,
+              borderRadius: 8,
               overflowX: "auto",
               whiteSpace: "pre-wrap",
               wordBreak: "break-word",

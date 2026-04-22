@@ -25,6 +25,12 @@
   --error: #9d2d27;
   --ok: #2d7b47;
   --shadow: 0 16px 32px rgba(70, 46, 24, 0.08);
+  --radius-control: 8px;
+  --radius-panel: 8px;
+  --radius-card: 10px;
+  --radius-stage: 10px;
+  --radius-chip: 7px;
+  --radius-handle: 5px;
 }
 
 * {
@@ -53,7 +59,7 @@ select {
 button,
 input,
 select {
-  border-radius: 12px;
+  border-radius: var(--radius-control);
   border: 1px solid var(--line);
   background: var(--surface-strong);
   color: var(--ink);
@@ -159,7 +165,7 @@ textarea {
   display: inline-flex;
   align-items: center;
   padding: 0.4rem 0.74rem;
-  border-radius: 999px;
+  border-radius: var(--radius-chip);
   font-size: 0.82rem;
   font-weight: 700;
   border: 1px solid currentColor;
@@ -183,7 +189,7 @@ textarea {
 
 .banner {
   padding: 10px 12px;
-  border-radius: 14px;
+  border-radius: var(--radius-panel);
   border: 1px solid var(--line);
   background: var(--surface-strong);
   box-shadow: 0 8px 20px rgba(70, 46, 24, 0.05);
@@ -218,7 +224,7 @@ textarea {
 
 .card {
   border: 1px solid rgba(28, 36, 48, 0.08);
-  border-radius: 16px;
+  border-radius: var(--radius-card);
   background: linear-gradient(180deg, rgba(255, 253, 249, 0.97), rgba(252, 249, 243, 0.92));
   box-shadow: var(--shadow);
 }
@@ -280,7 +286,7 @@ textarea {
   display: inline-flex;
   padding: 3px;
   border: 1px solid var(--line);
-  border-radius: 14px;
+  border-radius: var(--radius-control);
   background: rgba(255, 255, 255, 0.58);
 }
 
@@ -338,7 +344,7 @@ textarea {
   position: relative;
   overflow: auto;
   overscroll-behavior: contain;
-  border-radius: 18px;
+  border-radius: var(--radius-stage);
   border: 1px solid rgba(28, 36, 48, 0.12);
   background:
     linear-gradient(145deg, rgba(18, 22, 29, 0.98), rgba(39, 43, 56, 0.92));
@@ -386,7 +392,7 @@ textarea {
   flex-wrap: wrap;
   gap: 6px;
   padding: 8px;
-  border-radius: 14px;
+  border-radius: var(--radius-panel);
   border: 1px solid rgba(255, 255, 255, 0.16);
   background: rgba(12, 15, 22, 0.82);
   color: #fff8f1;
@@ -397,7 +403,7 @@ textarea {
 
 .preview-mode-pill {
   padding: 0.22rem 0.54rem;
-  border-radius: 999px;
+  border-radius: var(--radius-chip);
   border: 1px solid rgba(255, 255, 255, 0.16);
   background: rgba(255, 255, 255, 0.08);
   font-size: 0.78rem;
@@ -481,7 +487,7 @@ textarea {
   pointer-events: auto;
   min-height: 0;
   padding: 0.32rem 0.58rem;
-  border-radius: 999px;
+  border-radius: var(--radius-chip);
   border: 1px solid rgba(255, 255, 255, 0.26);
   background: rgba(255, 255, 255, 0.16);
   color: #fffaf3;
@@ -562,7 +568,7 @@ textarea {
   height: 16px;
   margin: 0;
   padding: 0;
-  border-radius: 999px;
+  border-radius: var(--radius-handle);
   border: 2px solid #fff8f1;
   background: var(--accent);
   transform: translate(-50%, -50%);
@@ -603,7 +609,7 @@ textarea {
   margin: 0;
   padding: 0;
   border: 0;
-  border-radius: 999px;
+  border-radius: 0;
   background: transparent;
   box-shadow: none;
   pointer-events: auto;
@@ -709,7 +715,7 @@ textarea {
 
 .footer-metrics span {
   padding: 0.38rem 0.64rem;
-  border-radius: 999px;
+  border-radius: var(--radius-chip);
   border: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.56);
   color: var(--muted);
@@ -719,7 +725,7 @@ textarea {
 
 .drop-inline {
   padding: 0.74rem 0.88rem;
-  border-radius: 14px;
+  border-radius: var(--radius-panel);
   border: 1px dashed rgba(195, 95, 51, 0.34);
   background: rgba(255, 245, 236, 0.72);
   color: var(--muted);
@@ -739,7 +745,7 @@ textarea {
   display: grid;
   gap: 4px;
   padding: 8px 10px;
-  border-radius: 14px;
+  border-radius: var(--radius-panel);
   border: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.58);
   transition:
@@ -789,7 +795,7 @@ textarea {
   gap: 2px;
   margin-top: 0;
   padding: 7px 10px;
-  border-radius: 14px;
+  border-radius: var(--radius-panel);
   border: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.56);
 }
@@ -823,7 +829,7 @@ textarea {
 .meta-tile,
 .summary-box {
   padding: 8px 10px;
-  border-radius: 14px;
+  border-radius: var(--radius-panel);
   border: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.56);
 }
@@ -954,7 +960,7 @@ textarea {
 .subtle-note {
   margin-top: 2px;
   padding: 8px 10px;
-  border-radius: 14px;
+  border-radius: var(--radius-panel);
   border: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.52);
   font-size: 0.88rem;
@@ -1103,7 +1109,7 @@ textarea {
   }
 
   .card {
-    border-radius: 18px;
+    border-radius: var(--radius-card);
   }
 
   .stage-card,
