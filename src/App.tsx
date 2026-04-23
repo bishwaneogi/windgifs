@@ -2,6 +2,7 @@ import {
   type CSSProperties,
   type ChangeEvent,
   type DragEvent,
+  type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
   type SyntheticEvent,
   startTransition,
@@ -22,8 +23,10 @@ import {
   renderMarkupOverlayPng,
 } from "./lib/export";
 import {
+  clampViewportOffset,
   clientPointToNormalized,
   deltaBetweenPoints,
+  getViewportOffsetBounds,
   getZoomedViewport,
   moveNormalizedRect,
   normalizedRectToStyle,
@@ -84,6 +87,17 @@ const AUTO_TEST_SOURCE_PATH =
 
 type EditorMode = "crop" | "shape";
 type ArrowEndpoint = "start" | "end";
+type ZoomAnchor = {
+  contentXRatio: number;
+  contentYRatio: number;
+  viewportX: number;
+  viewportY: number;
+};
+type PreviewPanState = {
+  startClientX: number;
+  startClientY: number;
+  startOffset: Point;
+};
 
 type BatchVideo = {
   id: string;
@@ -468,8 +482,8 @@ function buildPointStyle(point: Point): CSSProperties {
   };
 }
 
-function clampScrollPosition(value: number, max: number): number {
-  return Math.max(0, Math.min(value, Math.max(0, max)));
+function clampRatio(value: number): number {
+  return Math.max(0, Math.min(value, 1));
 }
 
 function buildCropEdgeStyle(crop: NormalizedRect, handle: "n" | "e" | "s" | "w"): CSSProperties {
@@ -558,12 +572,7 @@ function App() {
   const previewObjectUrlsRef = useRef<string[]>([]);
   const qualityPreviewRequestIdRef = useRef(0);
   const stageRef = useRef<HTMLDivElement | null>(null);
-  const pendingZoomAnchorRef = useRef<{
-    contentXRatio: number;
-    contentYRatio: number;
-    viewportX: number;
-    viewportY: number;
-  } | null>(null);
+  const pendingZoomAnchorRef = useRef<ZoomAnchor | null>(null);
   const didAutoLoadTestSourceRef = useRef(false);
   const [batchVideos, setBatchVideos] = useState<BatchVideo[]>([]);
   const [activeVideoId, setActiveVideoId] = useState<string | null>(null);
@@ -586,6 +595,8 @@ function App() {
   const [isRenderingQualityPreview, setIsRenderingQualityPreview] = useState(false);
   const [qualityPreviewFailed, setQualityPreviewFailed] = useState(false);
   const [previewZoom, setPreviewZoom] = useState(1);
+  const [previewOffset, setPreviewOffset] = useState<Point>({ x: 0, y: 0 });
+  const [previewPan, setPreviewPan] = useState<PreviewPanState | null>(null);
   const [playbackTime, setPlaybackTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const activeVideo = batchVideos.find((video) => video.id === activeVideoId) ?? null;
@@ -655,6 +666,8 @@ function App() {
     setQualityPreviewFrameTime(null);
     setIsRenderingQualityPreview(false);
     setPreviewZoom(1);
+    setPreviewOffset({ x: 0, y: 0 });
+    setPreviewPan(null);
     setPlaybackTime(0);
     setIsPlaying(false);
   }, [project?.source.fileName, project?.source.previewUrl, project?.source.sourcePath]);
@@ -1217,16 +1230,14 @@ function App() {
     event.preventDefault();
     event.stopPropagation();
 
-    if (!stageRef.current || !stageViewport || event.deltaY === 0) {
+    if (!stageRef.current || !stageViewport || !displayOffset || event.deltaY === 0) {
       return;
     }
 
     const bounds = stageRef.current.getBoundingClientRect();
     pendingZoomAnchorRef.current = {
-      contentXRatio:
-        (stageRef.current.scrollLeft + event.clientX - bounds.left) / stageViewport.contentWidth,
-      contentYRatio:
-        (stageRef.current.scrollTop + event.clientY - bounds.top) / stageViewport.contentHeight,
+      contentXRatio: clampRatio((event.clientX - bounds.left - displayOffset.x) / stageViewport.width),
+      contentYRatio: clampRatio((event.clientY - bounds.top - displayOffset.y) / stageViewport.height),
       viewportX: event.clientX - bounds.left,
       viewportY: event.clientY - bounds.top,
     };
@@ -1459,6 +1470,15 @@ function App() {
     stageMediaDimensions?.height ?? null,
     previewZoom,
   );
+  const stageOffsetBounds = stageViewport
+    ? getViewportOffsetBounds(stageSize.width, stageSize.height, stageViewport)
+    : null;
+  const displayOffset =
+    stageOffsetBounds && stageViewport
+      ? clampViewportOffset(previewOffset, stageOffsetBounds)
+      : stageViewport
+        ? { x: stageViewport.left, y: stageViewport.top }
+        : null;
   const previewRenderSpace = stageViewport
     ? createShapeRenderSpace(stageViewport.width, stageViewport.height)
     : null;
@@ -1504,49 +1524,59 @@ function App() {
       ? Math.round(project.export.targetFileSizeMb * 1024 * 1024)
       : null;
   const stageFrameTime = resolveQualityPreviewFrameTime(project, playbackTime);
+  const canPanPreview = Boolean(
+    stageOffsetBounds &&
+      (stageOffsetBounds.minX !== stageOffsetBounds.maxX ||
+        stageOffsetBounds.minY !== stageOffsetBounds.maxY),
+  );
+  const isPanningPreview = Boolean(previewPan);
 
   useLayoutEffect(() => {
-    const element = stageRef.current;
-    if (!element || !stageViewport) {
+    if (!stageViewport || !stageOffsetBounds) {
       return;
     }
 
-    const maxScrollLeft = stageViewport.contentWidth - stageSize.width;
-    const maxScrollTop = stageViewport.contentHeight - stageSize.height;
     const zoomAnchor = pendingZoomAnchorRef.current;
     pendingZoomAnchorRef.current = null;
 
-    if (zoomAnchor) {
-      element.scrollLeft = clampScrollPosition(
-        zoomAnchor.contentXRatio * stageViewport.contentWidth - zoomAnchor.viewportX,
-        maxScrollLeft,
-      );
-      element.scrollTop = clampScrollPosition(
-        zoomAnchor.contentYRatio * stageViewport.contentHeight - zoomAnchor.viewportY,
-        maxScrollTop,
-      );
-      return;
-    }
+    setPreviewOffset((currentOffset) =>
+      {
+        const nextOffset = clampViewportOffset(
+          zoomAnchor
+            ? {
+                x: zoomAnchor.viewportX - zoomAnchor.contentXRatio * stageViewport.width,
+                y: zoomAnchor.viewportY - zoomAnchor.contentYRatio * stageViewport.height,
+              }
+            : currentOffset,
+          stageOffsetBounds,
+        );
 
-    element.scrollLeft = clampScrollPosition((stageViewport.contentWidth - stageSize.width) / 2, maxScrollLeft);
-    element.scrollTop = clampScrollPosition((stageViewport.contentHeight - stageSize.height) / 2, maxScrollTop);
+        return nextOffset.x === currentOffset.x && nextOffset.y === currentOffset.y
+          ? currentOffset
+          : nextOffset;
+      },
+    );
   }, [
     previewZoom,
     stageSize.height,
     stageSize.width,
-    stageViewport?.contentHeight,
-    stageViewport?.contentWidth,
+    stageOffsetBounds?.maxX,
+    stageOffsetBounds?.maxY,
+    stageOffsetBounds?.minX,
+    stageOffsetBounds?.minY,
+    stageViewport?.height,
+    stageViewport?.width,
   ]);
 
   const readNormalizedPointer = useEffectEvent((clientX: number, clientY: number) => {
-    if (!stageRef.current || !stageViewport) {
+    if (!stageRef.current || !stageViewport || !displayOffset) {
       return null;
     }
 
     const bounds = stageRef.current.getBoundingClientRect();
     const visiblePoint = clientPointToNormalized(clientX, clientY, {
-      left: bounds.left + stageViewport.left - stageRef.current.scrollLeft,
-      top: bounds.top + stageViewport.top - stageRef.current.scrollTop,
+      left: bounds.left + displayOffset.x,
+      top: bounds.top + displayOffset.y,
       width: stageViewport.width,
       height: stageViewport.height,
     });
@@ -1644,8 +1674,44 @@ function App() {
     };
   }, [interaction]);
 
+  useEffect(() => {
+    if (!previewPan || !stageOffsetBounds) {
+      return;
+    }
+
+    const handlePointerMove = (event: PointerEvent) => {
+      setPreviewOffset((currentOffset) => {
+        const nextOffset = clampViewportOffset(
+          {
+            x: previewPan.startOffset.x + (event.clientX - previewPan.startClientX),
+            y: previewPan.startOffset.y + (event.clientY - previewPan.startClientY),
+          },
+          stageOffsetBounds,
+        );
+
+        return nextOffset.x === currentOffset.x && nextOffset.y === currentOffset.y
+          ? currentOffset
+          : nextOffset;
+      });
+    };
+
+    const clearPreviewPan = () => {
+      setPreviewPan(null);
+    };
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", clearPreviewPan);
+    window.addEventListener("pointercancel", clearPreviewPan);
+
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", clearPreviewPan);
+      window.removeEventListener("pointercancel", clearPreviewPan);
+    };
+  }, [previewPan, stageOffsetBounds]);
+
   function beginCropMove(event: ReactPointerEvent<HTMLElement>) {
-    if (!project) {
+    if (event.button !== 0 || !project) {
       return;
     }
 
@@ -1665,7 +1731,7 @@ function App() {
   }
 
   function beginCropResize(handle: ResizeHandle, event: ReactPointerEvent<HTMLElement>) {
-    if (!project) {
+    if (event.button !== 0 || !project) {
       return;
     }
 
@@ -1686,6 +1752,10 @@ function App() {
   }
 
   function beginShapeMove(shapeId: string, event: ReactPointerEvent<Element>) {
+    if (event.button !== 0) {
+      return;
+    }
+
     const targetShape = project?.markup.find((shape) => shape.id === shapeId);
     if (!targetShape) {
       return;
@@ -1713,6 +1783,10 @@ function App() {
     handle: ResizeHandle,
     event: ReactPointerEvent<HTMLElement>,
   ) {
+    if (event.button !== 0) {
+      return;
+    }
+
     const targetShape = project?.markup.find((shape) => shape.id === shapeId);
     if (!targetShape) {
       return;
@@ -1741,6 +1815,10 @@ function App() {
     endpoint: ArrowEndpoint,
     event: ReactPointerEvent<HTMLElement>,
   ) {
+    if (event.button !== 0) {
+      return;
+    }
+
     const targetShape = project?.markup.find((shape) => shape.id === shapeId);
     if (!targetShape) {
       return;
@@ -1765,13 +1843,37 @@ function App() {
   }
 
   function onSurfacePointerDown(event: ReactPointerEvent<HTMLDivElement>) {
-    if (editorMode === "shape" && event.target === event.currentTarget) {
+    if (event.button === 0 && editorMode === "shape" && event.target === event.currentTarget) {
       setSelectedShapeId(null);
     }
   }
 
+  function preventUiContextMenu(event: ReactMouseEvent<HTMLElement>) {
+    event.preventDefault();
+  }
+
+  function preventStageAuxiliaryDefault(event: ReactMouseEvent<HTMLDivElement>) {
+    if (event.button === 1) {
+      event.preventDefault();
+    }
+  }
+
+  function beginPreviewPan(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.button !== 1 || !displayOffset) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    setPreviewPan({
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      startOffset: displayOffset,
+    });
+  }
+
   return (
-    <main className="app-shell">
+    <main className="app-shell" onContextMenu={preventUiContextMenu}>
       <header className="topbar">
         <div className="brand-block compact-brand">
           <h1>WindGifs</h1>
@@ -1906,16 +2008,17 @@ function App() {
               </div>
             </aside>
 
-            <div ref={stageRef} className="preview-stage">
+            <div
+              ref={stageRef}
+              className={`preview-stage ${canPanPreview ? "is-pannable" : ""} ${
+                isPanningPreview ? "is-panning" : ""
+              }`}
+              onPointerDown={beginPreviewPan}
+              onMouseDown={preventStageAuxiliaryDefault}
+            >
               {previewUrl ? (
                 <>
-                <div
-                  className="preview-canvas"
-                  style={{
-                    width: `${stageViewport?.contentWidth ?? stageSize.width}px`,
-                    height: `${stageViewport?.contentHeight ?? stageSize.height}px`,
-                  }}
-                >
+                <div className="preview-canvas">
                   <video
                     ref={previewVideoRef}
                     key={previewUrl}
@@ -1925,8 +2028,8 @@ function App() {
                     style={
                       stageViewport
                         ? {
-                            left: `${stageViewport.left}px`,
-                            top: `${stageViewport.top}px`,
+                            left: `${displayOffset?.x ?? stageViewport.left}px`,
+                            top: `${displayOffset?.y ?? stageViewport.top}px`,
                             width: `${stageViewport.width}px`,
                             height: `${stageViewport.height}px`,
                           }
@@ -1963,8 +2066,8 @@ function App() {
                       style={
                         stageViewport
                           ? {
-                              left: `${stageViewport.left}px`,
-                              top: `${stageViewport.top}px`,
+                              left: `${displayOffset?.x ?? stageViewport.left}px`,
+                              top: `${displayOffset?.y ?? stageViewport.top}px`,
                               width: `${stageViewport.width}px`,
                               height: `${stageViewport.height}px`,
                             }
@@ -1977,8 +2080,8 @@ function App() {
                     <div
                       className={`editor-surface mode-${editorMode}`}
                       style={{
-                        left: `${stageViewport.left}px`,
-                        top: `${stageViewport.top}px`,
+                        left: `${displayOffset?.x ?? stageViewport.left}px`,
+                        top: `${displayOffset?.y ?? stageViewport.top}px`,
                         width: `${stageViewport.width}px`,
                         height: `${stageViewport.height}px`,
                       }}
@@ -2305,11 +2408,6 @@ function App() {
           <section className="card side-card editor-card">
             <div className="side-head compact-head">
               <h2>Editor</h2>
-              {selectedShape && (
-                <button type="button" className="ghost-button danger" onClick={removeSelectedShape}>
-                  Delete
-                </button>
-              )}
             </div>
 
             <div
@@ -2384,53 +2482,61 @@ function App() {
               )}
 
               {selectedShape ? (
-                <div className="field-grid compact-fields">
-                  <label>
-                    Color
-                    <input
-                      type="color"
-                      value={selectedShape.color}
-                      onChange={(event) =>
-                        updateShapeById(selectedShape.id, { color: event.currentTarget.value })
-                      }
-                    />
-                  </label>
-                  <label>
-                    Stroke
-                    <input
-                      type="number"
-                      min={1}
-                      max={16}
-                      step={1}
-                      value={selectedShape.strokeWidth}
-                      onChange={(event) =>
-                        updateShapeById(selectedShape.id, {
-                          strokeWidth: Math.max(
-                            1,
-                            asNumber(event.currentTarget.value, selectedShape.strokeWidth),
-                          ),
-                        })
-                      }
-                    />
-                  </label>
-                  <label>
-                    Opacity
-                    <input
-                      type="number"
-                      min={0.1}
-                      max={1}
-                      step={0.1}
-                      value={selectedShape.opacity}
-                      onChange={(event) =>
-                        updateShapeById(selectedShape.id, {
-                          opacity: Math.min(
-                            1,
-                            Math.max(0.1, asNumber(event.currentTarget.value, selectedShape.opacity)),
-                          ),
-                        })
-                      }
-                    />
-                  </label>
+                <div className="selection-card-block">
+                  <div className="field-grid compact-fields">
+                    <label>
+                      Color
+                      <input
+                        type="color"
+                        value={selectedShape.color}
+                        onChange={(event) =>
+                          updateShapeById(selectedShape.id, { color: event.currentTarget.value })
+                        }
+                      />
+                    </label>
+                    <label>
+                      Stroke
+                      <input
+                        type="number"
+                        min={1}
+                        max={16}
+                        step={1}
+                        value={selectedShape.strokeWidth}
+                        onChange={(event) =>
+                          updateShapeById(selectedShape.id, {
+                            strokeWidth: Math.max(
+                              1,
+                              asNumber(event.currentTarget.value, selectedShape.strokeWidth),
+                            ),
+                          })
+                        }
+                      />
+                    </label>
+                    <label>
+                      Opacity
+                      <input
+                        type="number"
+                        min={0.1}
+                        max={1}
+                        step={0.1}
+                        value={selectedShape.opacity}
+                        onChange={(event) =>
+                          updateShapeById(selectedShape.id, {
+                            opacity: Math.min(
+                              1,
+                              Math.max(0.1, asNumber(event.currentTarget.value, selectedShape.opacity)),
+                            ),
+                          })
+                        }
+                      />
+                    </label>
+                  </div>
+
+                  <div className="secondary-row shape-actions">
+                    <button type="button" className="ghost-button danger" onClick={removeSelectedShape}>
+                      Delete shape
+                    </button>
+                  </div>
                 </div>
               ) : editorMode === "shape" ? (
                 <div className="subtle-note">Add or select a shape from the toolbar.</div>

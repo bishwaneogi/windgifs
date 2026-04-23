@@ -480,7 +480,7 @@ textarea {
 
 .preview-stage {
   position: relative;
-  overflow: auto;
+  overflow: hidden;
   overscroll-behavior: contain;
   border-radius: var(--radius-stage);
   border: 1px solid rgba(28, 36, 48, 0.12);
@@ -490,10 +490,18 @@ textarea {
   height: 100%;
 }
 
+.preview-stage.is-pannable {
+  cursor: grab;
+}
+
+.preview-stage.is-panning {
+  cursor: grabbing;
+}
+
 .preview-canvas {
   position: relative;
-  min-width: 100%;
-  min-height: 100%;
+  width: 100%;
+  height: 100%;
 }
 
 .preview-video,
@@ -1039,6 +1047,11 @@ textarea {
 .compact-fields input[type="color"] {
   min-height: 42px;
   padding: 0.22rem;
+}
+
+.shape-actions {
+  justify-content: flex-end;
+  margin-top: 10px;
 }
 
 .preset-grid {

@@ -13,7 +13,7 @@ controllable GIFs. It is built with Tauri, React, TypeScript, and FFmpeg.
 - Choose Fast, Balanced, or Best target-size compression effort.
 - Export batches in parallel with a conservative two-job limit.
 - Preview the source video and inspect an output-quality frame in the main stage.
-- Zoom the preview with the mouse wheel and scroll around when zoomed in.
+- Zoom the preview with the mouse wheel and pan with middle-mouse drag when zoomed in.
 - Trim the exported range.
 - Crop with direct mouse controls.
 - Add and edit rectangle, ellipse, and arrow markup layers.

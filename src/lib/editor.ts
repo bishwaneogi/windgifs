@@ -10,9 +10,13 @@ export interface ViewportRect {
   height: number;
 }
 
-export interface ZoomedViewportRect extends ViewportRect {
-  contentHeight: number;
-  contentWidth: number;
+export interface ZoomedViewportRect extends ViewportRect {}
+
+export interface ViewportOffsetBounds {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
 }
 
 export interface NormalizedRect {
@@ -89,16 +93,35 @@ export function getZoomedViewport(
   const safeZoom = clamp(zoom, 0.5, 4);
   const width = contained.width * safeZoom;
   const height = contained.height * safeZoom;
-  const contentWidth = Math.max(stageWidth, width);
-  const contentHeight = Math.max(stageHeight, height);
 
   return {
-    left: width >= stageWidth ? 0 : (contentWidth - width) / 2,
-    top: height >= stageHeight ? 0 : (contentHeight - height) / 2,
+    left: width >= stageWidth ? 0 : (stageWidth - width) / 2,
+    top: height >= stageHeight ? 0 : (stageHeight - height) / 2,
     width,
     height,
-    contentWidth,
-    contentHeight,
+  };
+}
+
+export function getViewportOffsetBounds(
+  stageWidth: number,
+  stageHeight: number,
+  viewport: ViewportRect,
+): ViewportOffsetBounds {
+  const centeredX = viewport.width >= stageWidth ? 0 : (stageWidth - viewport.width) / 2;
+  const centeredY = viewport.height >= stageHeight ? 0 : (stageHeight - viewport.height) / 2;
+
+  return {
+    minX: viewport.width > stageWidth ? stageWidth - viewport.width : centeredX,
+    maxX: viewport.width > stageWidth ? 0 : centeredX,
+    minY: viewport.height > stageHeight ? stageHeight - viewport.height : centeredY,
+    maxY: viewport.height > stageHeight ? 0 : centeredY,
+  };
+}
+
+export function clampViewportOffset(point: Point, bounds: ViewportOffsetBounds): Point {
+  return {
+    x: clamp(point.x, bounds.minX, bounds.maxX),
+    y: clamp(point.y, bounds.minY, bounds.maxY),
   };
 }
 
