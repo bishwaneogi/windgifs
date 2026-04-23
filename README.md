@@ -5,6 +5,12 @@
 WindGifs is a Windows-first desktop tool for turning short video clips into clean,
 controllable GIFs. It is built with Tauri, React, TypeScript, and FFmpeg.
 
+## Download
+
+[Download the latest Windows installer](https://github.com/bishwaneogi/windgifs/releases/latest)
+
+Current release: [WindGifs 0.2.1](https://github.com/bishwaneogi/windgifs/releases/tag/v0.2.1)
+
 ## Features
 
 - Open one or many local video files with a native Windows file picker.
